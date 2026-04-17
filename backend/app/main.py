@@ -9,8 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import sys
 from contextlib import asynccontextmanager
 from typing import List, Optional
+
+print(f"gammagamma: importing main (PORT={os.getenv('PORT')})", flush=True)
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,8 +27,13 @@ from .snapshot_service import (
     summary_row,
 )
 
-logging.basicConfig(level=get_settings().log_level)
+logging.basicConfig(
+    level=get_settings().log_level,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    stream=sys.stdout,
+)
 log = logging.getLogger("gammagamma")
+print("gammagamma: imports complete, defining app", flush=True)
 
 
 @asynccontextmanager
