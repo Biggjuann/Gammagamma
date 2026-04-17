@@ -1,18 +1,19 @@
-"""Underlying spot price — anchored to today's cash market open.
+"""Underlying spot price — anchored to the session the chain data is from.
 
-Databento historical-only licenses lag real-time by ~4h so put-call parity
-on the chain only gives yesterday's close. Users want their dashboard
-pinned to today's session, so we use Yahoo Finance as a free spot source
-and default to **today's OPEN price** — stable through the day, matches
-the reference point every trader uses for daily structure.
+The Databento options chain we pull is yesterday's cash close (previous
+business day). For internal consistency we anchor spot to the **same day's
+cash-market open**, so walls, flip, GVWAP, and spot all describe the same
+moment in time.
 
-Cached 30 min (the open doesn't change intraday; only the fallback live
-price might, and we don't need to refresh it fast).
+yfinance daily bars are free and include Open/High/Low/Close for every
+session. We grab the Open from the session that matches the chain date.
+
+Cached 24h since the historical open doesn't change.
 """
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from .cache import cached_call
@@ -37,64 +38,84 @@ _YAHOO_SYMBOLS = {
 }
 
 
-def get_live_spot(underlying: str) -> Optional[float]:
-    """Return today's cash-session OPEN price (or ``None``).
+def _previous_business_day(d: date) -> date:
+    day = d
+    while True:
+        day = day - timedelta(days=1)
+        if day.weekday() < 5:
+            return day
 
-    Cached 30 minutes. Returns ``None`` on failure so callers can fall
-    through to put-call parity.
+
+def get_session_open(
+    underlying: str, session_date: Optional[date] = None
+) -> Optional[float]:
+    """Return the cash-market OPEN for ``session_date`` (default = previous business day).
+
+    Matches the same day as the Databento chain we query, so spot and
+    structural levels are internally consistent.
     """
     if yf is None:
-        log.warning("yfinance not installed; no live spot for %s", underlying)
+        log.warning("yfinance not installed; no spot for %s", underlying)
         return None
 
     yahoo = _YAHOO_SYMBOLS.get(underlying)
     if yahoo is None:
         return None
 
+    if session_date is None:
+        session_date = _previous_business_day(datetime.now(timezone.utc).date())
+
+    key = f"{yahoo}:{session_date.isoformat()}"
+
     return cached_call(
-        namespace="spot_open",
-        key=yahoo,
-        ttl=timedelta(minutes=30),
-        loader=lambda: _fetch(yahoo),
+        namespace="spot_open_by_date",
+        key=key,
+        ttl=timedelta(hours=24),
+        loader=lambda: _fetch(yahoo, session_date),
     )
 
 
-def _fetch(yahoo: str) -> Optional[float]:
-    """Return today's cash-market OPEN price for ``yahoo`` (or most recent open).
+# Back-compat: old callers expected a live spot. They now receive the
+# anchored session open instead.
+get_live_spot = get_session_open
 
-    We anchor the dashboard to the opening print so the session's levels
-    remain stable through the day. Falls back to the last 1-minute close if
-    the daily open isn't yet populated (pre-market).
-    """
+
+def _fetch(yahoo: str, session_date: date) -> Optional[float]:
     try:
         t = yf.Ticker(yahoo)
-
-        # Daily bar — Open is the regular-session opening print.
-        hist = t.history(period="5d", interval="1d")
-        if hist is not None and not hist.empty and "Open" in hist.columns:
-            open_px = float(hist["Open"].iloc[-1])
-            if open_px > 0:
-                return open_px
-
-        # Pre-market fallback: first 1-minute bar of the current session.
-        intraday = t.history(period="1d", interval="1m")
-        if intraday is not None and not intraday.empty and "Open" in intraday.columns:
-            first_open = float(intraday["Open"].iloc[0])
-            if first_open > 0:
-                return first_open
-
-        # Last-resort fallback: most recent trade price.
-        fi = getattr(t, "fast_info", None)
-        if fi is not None:
-            for attr in ("last_price", "regular_market_price", "regularMarketPrice"):
-                val = getattr(fi, attr, None) or (
-                    fi.get(attr) if hasattr(fi, "get") else None
-                )
-                if val and val > 0:
-                    return float(val)
+        # Pull a small window around the target date so weekends / holidays
+        # don't leave us empty.
+        start = session_date - timedelta(days=1)
+        end = session_date + timedelta(days=2)
+        hist = t.history(start=start.isoformat(), end=end.isoformat(), interval="1d")
+        if hist is None or hist.empty or "Open" not in hist.columns:
+            return None
+        # Normalise the index to date for matching (yfinance returns timestamps).
+        hist = hist.reset_index()
+        date_col = "Date" if "Date" in hist.columns else hist.columns[0]
+        for _, row in hist.iterrows():
+            ts = row[date_col]
+            try:
+                row_date = ts.date() if hasattr(ts, "date") else ts
+            except Exception:  # noqa: BLE001
+                continue
+            if row_date == session_date:
+                open_px = float(row["Open"])
+                if open_px > 0:
+                    return open_px
+        # Fallback: last available open in the window.
+        open_px = float(hist["Open"].iloc[-1])
+        return open_px if open_px > 0 else None
     except Exception as exc:  # noqa: BLE001
-        log.warning("yfinance fetch for %s failed: %s", yahoo, exc)
+        log.warning(
+            "yfinance open fetch for %s on %s failed: %s",
+            yahoo, session_date, exc,
+        )
     return None
+
+
+__all__ = ["get_session_open", "get_live_spot"]
+
 
 
 __all__ = ["get_live_spot"]
