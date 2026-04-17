@@ -12,4 +12,4 @@ ENV NEXT_PUBLIC_API_BASE=${NEXT_PUBLIC_API_BASE}
 RUN npm run build
 ENV PORT=3000
 EXPOSE 3000
-CMD ["sh", "-c", "next start -p ${PORT:-3000}"]
+CMD ["sh", "-c", "next start -H :: -p ${PORT:-3000}"]
