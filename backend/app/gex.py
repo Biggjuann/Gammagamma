@@ -163,7 +163,7 @@ def build_chain_snapshot(
 
     spot = get_live_spot(underlying) or 0.0
     if spot > 0:
-        log.info("spot (chain-day open) for %s = %.2f", underlying, spot)
+        log.info("spot (live, yfinance) for %s = %.2f", underlying, spot)
     else:
         spot = _infer_spot_from_chain(defs, quotes_by_id) or 0.0
         if spot > 0:
