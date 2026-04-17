@@ -147,26 +147,25 @@ class DatabentoClient:
             if not self._has_key:
                 return _fixture_quotes(underlying)
             parent = _parent_symbol(underlying)
-            window = get_settings().cmbp_window_seconds
-            # Query yesterday's cash close — always inside a historical-only
-            # license window and gives the overnight structural state.
+            # bbo-1m = one NBBO row per instrument per minute. ~100× less data
+            # than cmbp-1's tick stream. We query the final minute of yesterday's
+            # cash session (19:59-20:00 UTC) and take the last row per contract.
             end = _last_settled_close(asof)
-            start = end - timedelta(seconds=window)
+            start = end - timedelta(minutes=1)
             log.info(
-                "databento fetch: cmbp-1 dataset=%s symbol=%s window=%ss end=%s",
-                self.dataset, parent, window, end.isoformat(),
+                "databento fetch: bbo-1m dataset=%s symbol=%s end=%s",
+                self.dataset, parent, end.isoformat(),
             )
             data = self._client.timeseries.get_range(  # type: ignore[union-attr]
                 dataset=self.dataset,
-                schema="cmbp-1",
+                schema="bbo-1m",
                 symbols=[parent],
                 stype_in="parent",
                 start=start.isoformat(),
                 end=end.isoformat(),
-                limit=200_000,
             )
             df = data.to_df()
-            log.info("databento fetched %d cmbp-1 rows for %s", len(df), parent)
+            log.info("databento fetched %d bbo-1m rows for %s", len(df), parent)
             return _rows_to_quotes(df)
 
         return cached_call(
@@ -333,21 +332,47 @@ def _rows_to_definitions(df: pd.DataFrame, underlying: str) -> List[OptionDefini
 def _rows_to_quotes(df: pd.DataFrame) -> List[Quote]:
     if df is None or df.empty:
         return []
-    # take the last row per instrument
-    df = df.sort_values("ts_recv").drop_duplicates("instrument_id", keep="last")
+    # Newer Databento SDKs put ts_recv / ts_event as the DataFrame *index*.
+    # Reset so we can address it as a column regardless of version.
+    df = df.reset_index()
+    ts_col = next(
+        (c for c in ("ts_recv", "ts_event") if c in df.columns),
+        None,
+    )
+    if ts_col:
+        df = df.sort_values(ts_col)
+    df = df.drop_duplicates("instrument_id", keep="last")
+
     quotes: List[Quote] = []
     for _, r in df.iterrows():
+        bid = _to_float(r.get("bid_px_00") or r.get("bid_px"))
+        ask = _to_float(r.get("ask_px_00") or r.get("ask_px"))
+        # DBN prices are fixed-point nanos (1e9 scale). A raw mid quote of e.g.
+        # 1.25 will be 1_250_000_000 in the column.
+        if bid > 1e6:
+            bid /= 1e9
+        if ask > 1e6:
+            ask /= 1e9
+        ts_val = r[ts_col] if ts_col else None
         quotes.append(
             Quote(
                 instrument_id=int(r["instrument_id"]),
-                bid=float(r.get("bid_px_00", 0) or 0) / 1e9,
-                ask=float(r.get("ask_px_00", 0) or 0) / 1e9,
-                bid_size=int(r.get("bid_sz_00", 0) or 0),
-                ask_size=int(r.get("ask_sz_00", 0) or 0),
-                ts=pd.to_datetime(r["ts_recv"]).to_pydatetime(),
+                bid=bid,
+                ask=ask,
+                bid_size=int(r.get("bid_sz_00") or r.get("bid_sz") or 0),
+                ask_size=int(r.get("ask_sz_00") or r.get("ask_sz") or 0),
+                ts=pd.to_datetime(ts_val).to_pydatetime() if ts_val is not None
+                else datetime.now(timezone.utc),
             )
         )
     return quotes
+
+
+def _to_float(v) -> float:
+    try:
+        return float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _rows_to_trades(df: pd.DataFrame) -> List[TradeTick]:
