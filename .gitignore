@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+!.env.example
+
+# Cache
+.cache/
+backend/.cache/
+
+# Node / Next
+node_modules/
+.next/
+out/
+.vercel/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/

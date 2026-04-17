@@ -1,0 +1,35 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html, body {
+  background: #060913;
+  color: #E6ECFF;
+}
+
+.number {
+  font-variant-numeric: tabular-nums;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+}
+
+.bg-radial-fade {
+  background-image:
+    radial-gradient(ellipse 80% 50% at 50% -10%, rgba(34,211,238,0.15), transparent 60%),
+    radial-gradient(ellipse 60% 40% at 80% 20%, rgba(167,139,250,0.12), transparent 55%);
+}
+
+.border-grid {
+  border-color: rgba(148, 163, 184, 0.08);
+}
+
+.card {
+  @apply rounded-xl border border-white/5 bg-ink-800/70 backdrop-blur-sm;
+}
+
+.card-header {
+  @apply flex items-center justify-between px-4 py-3 border-b border-white/5 text-xs uppercase tracking-wider text-slate-400;
+}
