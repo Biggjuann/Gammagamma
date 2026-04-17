@@ -24,10 +24,20 @@ export type Bundle = {
     gvwap: number;
     regime_score: number;
   };
+  playbook: Playbook;
   rows: ChainRow[];
   per_strike: Record<string, { call_gex: number; put_gex: number; net_gex: number; oi: number }>;
   per_expiry: Record<string, number>;
   flow: FlowRow[];
+};
+
+export type Playbook = {
+  bias: "MEAN REVERT" | "TREND" | "PIVOT WATCH" | "DIRECTIONAL";
+  regime: "COMPRESSED" | "NEUTRAL" | "TRANSITION" | "ELEVATED";
+  headline: string;
+  bullets: string[];
+  key_levels: { label: string; price: number | null; note: string }[];
+  risk_flags: string[];
 };
 
 export type ChainRow = {

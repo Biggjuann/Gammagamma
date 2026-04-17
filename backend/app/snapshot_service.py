@@ -21,6 +21,7 @@ from dataclasses import replace
 from .config import TICKER_ALIASES, get_settings
 from .flow import FlowRow, build_flow
 from .gex import ChainRow, ChainSnapshot, build_chain_snapshot, gex_by_expiry, gex_by_strike
+from .playbook import Playbook, build_playbook
 from .signals import SignalBundle, StructuralLevels, compute_signals, structural_levels
 
 log = logging.getLogger(__name__)
@@ -41,6 +42,7 @@ class Bundle:
     per_strike: Dict[str, Dict[str, float]]
     per_expiry: Dict[str, float]
     flow: List[FlowRow]
+    playbook: Playbook
 
     def to_json(self) -> dict:
         return {
@@ -62,6 +64,7 @@ class Bundle:
                 "major_put_walls": self.levels.major_put_walls,
             },
             "signals": asdict(self.signals),
+            "playbook": self.playbook.to_json(),
             "rows": self.rows,
             "per_strike": {str(k): v for k, v in self.per_strike.items()},
             "per_expiry": self.per_expiry,
@@ -117,6 +120,20 @@ def _build(underlying: str, expiry_filter: Optional[str]) -> Bundle:
     levels = structural_levels(snap)
     sigs = compute_signals(snap, levels)
     flow = build_flow(source, snap)
+    playbook = build_playbook(
+        underlying=underlying,
+        spot=snap.spot,
+        total_gex=snap.total_gex,
+        call_wall=levels.call_wall,
+        put_wall=levels.put_wall,
+        gamma_flip=levels.gamma_flip,
+        gvwap=levels.gvwap,
+        regime_score=sigs.regime_score,
+        sss=sigs.sss,
+        fpi=sigs.fpi,
+        regd=sigs.regd,
+        hv=sigs.hv,
+    )
     return Bundle(
         underlying=underlying,
         asof=snap.asof,
@@ -131,6 +148,7 @@ def _build(underlying: str, expiry_filter: Optional[str]) -> Bundle:
         per_strike={f"{k:.2f}": v for k, v in gex_by_strike(snap).items()},
         per_expiry=gex_by_expiry(snap),
         flow=flow,
+        playbook=playbook,
     )
 
 

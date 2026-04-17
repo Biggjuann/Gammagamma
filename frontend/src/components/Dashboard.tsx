@@ -7,6 +7,7 @@ import ExpiryFilterBar from "@/components/ExpiryFilter";
 import ExpiryGexChart from "@/components/ExpiryGexChart";
 import FlowTable from "@/components/FlowTable";
 import LevelsPanel from "@/components/LevelsPanel";
+import PlaybookCard from "@/components/PlaybookCard";
 import RegimeMeter from "@/components/RegimeMeter";
 import SignalGauge from "@/components/SignalGauge";
 import StrikeGexChart from "@/components/StrikeGexChart";
@@ -73,6 +74,8 @@ export default function Dashboard() {
           {data ? <TickerHeader bundle={data} /> : <div className="h-10" />}
           <ExpiryFilterBar value={expiry} onChange={setExpiry} />
         </div>
+
+        {data?.playbook && <PlaybookCard playbook={data.playbook} />}
 
         <div className="grid grid-cols-12 gap-4">
           <div className="col-span-12 xl:col-span-8">
