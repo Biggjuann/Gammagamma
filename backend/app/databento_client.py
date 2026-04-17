@@ -153,19 +153,19 @@ class DatabentoClient:
             end = _last_settled_close(asof)
             start = end - timedelta(minutes=1)
             log.info(
-                "databento fetch: bbo-1m dataset=%s symbol=%s end=%s",
+                "databento fetch: cbbo-1m dataset=%s symbol=%s end=%s",
                 self.dataset, parent, end.isoformat(),
             )
             data = self._client.timeseries.get_range(  # type: ignore[union-attr]
                 dataset=self.dataset,
-                schema="bbo-1m",
+                schema="cbbo-1m",
                 symbols=[parent],
                 stype_in="parent",
                 start=start.isoformat(),
                 end=end.isoformat(),
             )
             df = data.to_df()
-            log.info("databento fetched %d bbo-1m rows for %s", len(df), parent)
+            log.info("databento fetched %d cbbo-1m rows for %s", len(df), parent)
             return _rows_to_quotes(df)
 
         return cached_call(
