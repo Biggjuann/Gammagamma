@@ -148,9 +148,9 @@ class DatabentoClient:
                 return _fixture_quotes(underlying)
             parent = _parent_symbol(underlying)
             window = get_settings().cmbp_window_seconds
-            # OPRA historical is delayed ~30 min. Shift the query back so we
-            # hit settled data instead of the edge of the stream.
-            end = asof - timedelta(minutes=30)
+            # Query yesterday's cash close — always inside a historical-only
+            # license window and gives the overnight structural state.
+            end = _last_settled_close(asof)
             start = end - timedelta(seconds=window)
             log.info(
                 "databento fetch: cmbp-1 dataset=%s symbol=%s window=%ss end=%s",
@@ -292,6 +292,17 @@ def _previous_business_day(dt: datetime):
         d = d - timedelta(days=1)
         if d.weekday() < 5:  # Mon-Fri
             return d
+
+
+def _last_settled_close(asof: datetime) -> datetime:
+    """Previous business day at 20:00 UTC (~16:00 ET US cash close).
+
+    Databento historical-only licenses lag real-time by several hours. Querying
+    yesterday's cash-close window is always inside the historical boundary and
+    gives us the overnight structural levels the dashboard actually needs.
+    """
+    d = _previous_business_day(asof)
+    return datetime(d.year, d.month, d.day, 20, 0, 0, tzinfo=timezone.utc)
 
 
 
