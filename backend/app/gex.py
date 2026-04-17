@@ -146,16 +146,23 @@ def build_chain_snapshot(
 
     quotes_by_id = {q.instrument_id: q for q in quotes}
 
-    # Derive spot via put-call parity on the options we already have. Falls
-    # back to a fixture spot if parity can't be solved (no matching C/P pair).
-    spot = _infer_spot_from_chain(defs, quotes_by_id) or 0.0
-    if spot <= 0:
-        from .fixtures import _spot  # type: ignore
+    # Spot precedence: live Yahoo Finance → put-call parity → fixture.
+    # Yahoo gives the real-time price users cross-check against. Parity gives
+    # yesterday's close (same as the chain). Fixture is last resort.
+    from .spot import get_live_spot
 
-        spot = _spot(underlying)
-        log.warning("spot fallback to fixture %.2f for %s", spot, underlying)
+    spot = get_live_spot(underlying) or 0.0
+    if spot > 0:
+        log.info("spot (live, yfinance) for %s = %.2f", underlying, spot)
     else:
-        log.info("spot (put-call parity) for %s = %.2f", underlying, spot)
+        spot = _infer_spot_from_chain(defs, quotes_by_id) or 0.0
+        if spot > 0:
+            log.info("spot (put-call parity) for %s = %.2f", underlying, spot)
+        else:
+            from .fixtures import _spot  # type: ignore
+
+            spot = _spot(underlying)
+            log.warning("spot fallback to fixture %.2f for %s", spot, underlying)
 
     # vectorise
     keep_defs: List = []
