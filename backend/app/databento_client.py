@@ -27,7 +27,7 @@ from typing import Any, Iterable, List, Optional
 import pandas as pd
 
 from .cache import cached_call
-from .config import get_settings
+from .config import get_settings  # noqa: F401  (used indirectly for cmbp window)
 
 log = logging.getLogger(__name__)
 
@@ -139,14 +139,17 @@ class DatabentoClient:
         def _load() -> List[Quote]:
             if not self._has_key:
                 return _fixture_quotes(underlying)
+            # tiny tick-stream window — enough for a point-in-time NBBO without
+            # paying for a full minute of tape.
+            window = get_settings().cmbp_window_seconds
             data = self._client.timeseries.get_range(  # type: ignore[union-attr]
                 dataset=self.dataset,
                 schema="cmbp-1",
                 symbols=[f"{underlying}.OPT"],
                 stype_in="parent",
-                start=(asof - timedelta(minutes=1)).isoformat(),
+                start=(asof - timedelta(seconds=window)).isoformat(),
                 end=asof.isoformat(),
-                limit=1_000_000,
+                limit=200_000,
             )
             df = data.to_df()
             return _rows_to_quotes(df)

@@ -11,26 +11,31 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-DEFAULT_UNIVERSE = [
-    "SPX", "SPY", "QQQ", "IWM", "DIA", "VIX", "NDX", "RUT",
-    "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "TSLA",
-    "AMD", "AVGO", "NFLX", "COST", "JPM", "V", "XOM", "UNH", "JNJ",
-    "WMT", "PG", "MA", "HD", "CVX", "LLY", "ABBV", "MRK", "PEP", "KO",
-    "BAC", "CRM", "ORCL", "MCD", "ADBE", "CSCO", "NKE", "TMO", "ABT",
-    "DIS", "INTC", "VZ", "T", "PFE", "WFC", "LIN", "BMY", "CMCSA",
-    "PM", "RTX", "UPS", "HON", "IBM", "QCOM", "AMGN", "LOW", "GS",
-    "CAT", "DE", "BA", "MS", "BLK", "NOW", "AXP", "UBER", "INTU",
-    "BKNG", "SBUX", "SPGI", "TXN", "AMAT", "ISRG", "TJX", "PANW",
-    "PLTR", "SMCI", "COIN", "ARKK", "SOXL", "TQQQ", "SQQQ", "GLD",
-    "SLV", "USO", "TLT", "HYG", "XLF", "XLE", "XLK", "XLV", "SMH",
-]
+DEFAULT_UNIVERSE = ["SPX", "SPY", "QQQ", "ES"]
+
+
+# ES is a display alias: it reuses SPY's option chain and renders strikes / spot
+# at ES scale (×10). No extra Databento fetch.
+TICKER_ALIASES = {
+    "ES": {"source": "SPY", "scale": 10.0},
+}
+
+
+# Scheduled snapshot times (local to SCHEDULE_TZ). One at cash open, one after close.
+SCHEDULE_TIMES = [(8, 30), (16, 0)]
+SCHEDULE_TZ = "America/Chicago"
 
 
 @dataclass(frozen=True)
 class Settings:
     databento_api_key: str = os.getenv("DATABENTO_API_KEY", "")
     risk_free_rate: float = float(os.getenv("RISK_FREE_RATE", "0.0525"))
-    refresh_interval_seconds: int = int(os.getenv("REFRESH_INTERVAL_SECONDS", "60"))
+    # fallback TTL if the scheduler isn't running; ~12h lets one snapshot last
+    # until the next scheduled refresh.
+    refresh_interval_seconds: int = int(os.getenv("REFRESH_INTERVAL_SECONDS", "43200"))
+    # cmbp-1 tick-stream window for each snapshot call. 5 s is enough for a
+    # point-in-time NBBO without pulling a full minute of tape (~10× saving).
+    cmbp_window_seconds: int = int(os.getenv("CMBP_WINDOW_SECONDS", "5"))
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     universe: List[str] = field(
         default_factory=lambda: [
@@ -42,6 +47,7 @@ class Settings:
         ]
     )
     opra_dataset: str = "OPRA.PILLAR"
+    schedule_enabled: bool = os.getenv("SCHEDULE_ENABLED", "true").lower() == "true"
 
 
 @lru_cache

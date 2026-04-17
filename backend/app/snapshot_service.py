@@ -16,9 +16,11 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from .config import get_settings
+from dataclasses import replace
+
+from .config import TICKER_ALIASES, get_settings
 from .flow import FlowRow, build_flow
-from .gex import ChainSnapshot, build_chain_snapshot, gex_by_expiry, gex_by_strike
+from .gex import ChainRow, ChainSnapshot, build_chain_snapshot, gex_by_expiry, gex_by_strike
 from .signals import SignalBundle, StructuralLevels, compute_signals, structural_levels
 
 log = logging.getLogger(__name__)
@@ -88,11 +90,33 @@ _BUNDLE_EXPIRY: Dict[str, float] = {}
 _LOCK = threading.RLock()
 
 
+def _scale_snapshot(snap: ChainSnapshot, scale: float, as_underlying: str) -> ChainSnapshot:
+    """Rescale strikes / spot for alias tickers (e.g. ES from SPY × 10)."""
+    new_rows = [replace(r, strike=r.strike * scale) for r in snap.rows]
+    return ChainSnapshot(
+        underlying=as_underlying,
+        spot=snap.spot * scale,
+        asof=snap.asof,
+        rows=new_rows,
+        total_gex=snap.total_gex,
+        total_dex=snap.total_dex,
+        total_vanna=snap.total_vanna,
+        total_charm=snap.total_charm,
+    )
+
+
 def _build(underlying: str, expiry_filter: Optional[str]) -> Bundle:
-    snap: ChainSnapshot = build_chain_snapshot(underlying, expiry_filter=expiry_filter)
+    # resolve aliases (e.g. ES → fetch SPY, display at ES scale)
+    alias = TICKER_ALIASES.get(underlying)
+    source = alias["source"] if alias else underlying
+    scale = alias["scale"] if alias else 1.0
+
+    snap: ChainSnapshot = build_chain_snapshot(source, expiry_filter=expiry_filter)
+    if scale != 1.0:
+        snap = _scale_snapshot(snap, scale, underlying)
     levels = structural_levels(snap)
     sigs = compute_signals(snap, levels)
-    flow = build_flow(underlying, snap)
+    flow = build_flow(source, snap)
     return Bundle(
         underlying=underlying,
         asof=snap.asof,

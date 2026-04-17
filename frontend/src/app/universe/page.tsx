@@ -7,7 +7,7 @@ import { fmtBillions, fmtPrice, signClass } from "@/lib/format";
 
 export default function UniversePage() {
   const { data } = useSWR<{ rows: SummaryRow[] }>(endpoints.summary(), fetchJSON, {
-    refreshInterval: 60_000
+    refreshInterval: 600_000
   });
   const rows = data?.rows ?? [];
 

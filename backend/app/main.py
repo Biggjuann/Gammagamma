@@ -19,13 +19,20 @@ print(f"gammagamma: importing main (PORT={os.getenv('PORT')})", flush=True)
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from .config import get_settings
+from .config import SCHEDULE_TIMES, SCHEDULE_TZ, get_settings
 from .snapshot_service import (
     get_bundle,
     prime_universe,
     reset_cache,
     summary_row,
 )
+
+try:
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from apscheduler.triggers.cron import CronTrigger
+except ImportError:  # pragma: no cover
+    AsyncIOScheduler = None
+    CronTrigger = None
 
 logging.basicConfig(
     level=get_settings().log_level,
@@ -40,16 +47,51 @@ print("gammagamma: imports complete, defining app", flush=True)
 async def lifespan(app: FastAPI):
     settings = get_settings()
     log.info(
-        "Gammagamma boot — dataset=%s refresh=%ss universe=%d",
+        "Gammagamma boot — dataset=%s universe=%d scheduler=%s tz=%s",
         settings.opra_dataset,
-        settings.refresh_interval_seconds,
         len(settings.universe),
+        settings.schedule_enabled,
+        SCHEDULE_TZ,
     )
-    task = asyncio.create_task(_refresh_loop())
+    scheduler = None
+    if settings.schedule_enabled and AsyncIOScheduler is not None:
+        scheduler = AsyncIOScheduler(timezone=SCHEDULE_TZ)
+        for hour, minute in SCHEDULE_TIMES:
+            scheduler.add_job(
+                _scheduled_refresh,
+                CronTrigger(hour=hour, minute=minute, day_of_week="mon-fri"),
+                id=f"snapshot-{hour:02d}{minute:02d}",
+                replace_existing=True,
+            )
+        scheduler.start()
+        log.info(
+            "Scheduled snapshots at %s (%s)",
+            ", ".join(f"{h:02d}:{m:02d}" for h, m in SCHEDULE_TIMES),
+            SCHEDULE_TZ,
+        )
+        # prime once on boot so the dashboard has data immediately
+        asyncio.create_task(asyncio.to_thread(prime_universe))
+    else:
+        log.info("Scheduler disabled — bundles built on-demand")
     try:
         yield
     finally:
-        task.cancel()
+        if scheduler is not None:
+            scheduler.shutdown(wait=False)
+
+
+async def _scheduled_refresh() -> None:
+    log.info("Scheduled refresh starting")
+    reset_cache()
+    await asyncio.to_thread(prime_universe)
+    # push to any live WS subscribers
+    for sym in get_settings().universe:
+        try:
+            bundle = get_bundle(sym)
+            await _WS.broadcast(sym, bundle.to_json())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("broadcast %s failed: %s", sym, exc)
+    log.info("Scheduled refresh complete")
 
 
 app = FastAPI(title="Gammagamma API", version="0.1.0", lifespan=lifespan)
@@ -97,6 +139,13 @@ def ticker(
 def cache_reset() -> dict:
     reset_cache()
     return {"ok": True}
+
+
+@app.post("/api/refresh")
+async def refresh_now() -> dict:
+    """Manually trigger a full-universe refresh (same as a scheduled tick)."""
+    await _scheduled_refresh()
+    return {"ok": True, "universe": get_settings().universe}
 
 
 # ---------------------------------------------------------------------
@@ -156,22 +205,3 @@ async def ws_ticker(ws: WebSocket, symbol: str) -> None:
         await _WS.drop(sym, ws)
 
 
-# ---------------------------------------------------------------------
-# Background refresh
-# ---------------------------------------------------------------------
-async def _refresh_loop() -> None:
-    settings = get_settings()
-    while True:
-        try:
-            await asyncio.to_thread(prime_universe)
-            # push each bundle to subscribers
-            for sym in settings.universe:
-                try:
-                    bundle = get_bundle(sym)
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("refresh %s failed: %s", sym, exc)
-                    continue
-                await _WS.broadcast(sym, bundle.to_json())
-        except Exception as exc:  # noqa: BLE001
-            log.exception("refresh loop error: %s", exc)
-        await asyncio.sleep(settings.refresh_interval_seconds)

@@ -23,7 +23,9 @@ export default function Dashboard() {
   const [symbol, setSymbol] = useState("SPX");
   const [expiry, setExpiry] = useState<ExpiryFilter>("all");
   const { data, mutate } = useSWR<Bundle>(endpoints.ticker(symbol, expiry), fetchJSON, {
-    refreshInterval: 60_000,
+    // backend refreshes twice/day (08:30 & 16:00 CT) — a browser-side poll
+    // every 10 min just picks up scheduled refreshes without spamming the API.
+    refreshInterval: 600_000,
     revalidateOnFocus: false
   });
 
