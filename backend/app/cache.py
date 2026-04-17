@@ -1,24 +1,13 @@
-"""Lightweight two-tier (memory + disk) TTL cache.
+"""Two-tier TTL cache with per-key locking.
 
-Databento is billed per byte, so every Gammagamma call goes through this
-layer. Semantics:
+Databento is billed per byte, so we route every call through this layer.
 
-* **Memory tier** — dict keyed by ``(namespace, key)`` with expiry timestamp.
-  Zero-cost hits, lost on restart.
-* **Disk tier** — pickled payloads under ``CACHE_DIR`` (default
-  ``./.cache``). Survives restarts; reloaded lazily on miss.
-
-Use :func:`cached_call` as the one-stop wrapper::
-
-    chain = cached_call(
-        namespace="definitions",
-        key=f"{dataset}:{symbol}:{date}",
-        ttl=timedelta(hours=24),
-        loader=lambda: client.timeseries.get_range(...),
-    )
-
-Long TTLs are the default — definitions change daily, OI updates overnight,
-so we only pay for truly fresh data.
+Features:
+* Memory + disk tiers (disk survives restart).
+* Per-key async lock: concurrent misses for the same key serialize into one
+  loader call instead of N parallel fetches.
+* Stale-on-error fallback: if the loader raises and a stale value exists on
+  disk, return the stale value and log a warning.
 """
 from __future__ import annotations
 
@@ -50,7 +39,6 @@ class TTLCache:
         self._mem: Dict[str, _Entry] = {}
         self._lock = threading.RLock()
 
-    # ---- key hashing ---------------------------------------------------
     @staticmethod
     def _hash(namespace: str, key: str) -> str:
         h = hashlib.sha1(f"{namespace}::{key}".encode()).hexdigest()[:32]
@@ -59,7 +47,6 @@ class TTLCache:
     def _disk_path(self, namespace: str, key: str) -> Path:
         return CACHE_DIR / f"{self._hash(namespace, key)}.pkl"
 
-    # ---- core --------------------------------------------------------
     def get(self, namespace: str, key: str) -> Optional[Any]:
         k = self._hash(namespace, key)
         with self._lock:
@@ -110,6 +97,21 @@ class TTLCache:
 
 _CACHE = TTLCache()
 
+# Per-key locks for cached_call. We keep an interning dict so the same key
+# maps to the same Lock across callers; prevents N parallel fetches on a miss.
+_KEY_LOCKS: Dict[str, threading.Lock] = {}
+_KEY_LOCKS_GUARD = threading.Lock()
+
+
+def _key_lock(namespace: str, key: str) -> threading.Lock:
+    composite = f"{namespace}::{key}"
+    with _KEY_LOCKS_GUARD:
+        lock = _KEY_LOCKS.get(composite)
+        if lock is None:
+            lock = threading.Lock()
+            _KEY_LOCKS[composite] = lock
+    return lock
+
 
 def cache() -> TTLCache:
     return _CACHE
@@ -123,26 +125,35 @@ def cached_call(
     *,
     allow_stale_on_error: bool = True,
 ) -> Any:
-    """Run ``loader`` only if the cache misses.
+    """Run ``loader`` only if the cache misses. Serialise concurrent misses.
 
-    If the loader raises and a stale value exists on disk, return the stale
-    value (and log). This keeps the dashboard alive through transient
-    Databento outages without burning extra quota on retries.
+    Concurrent requests for the same (namespace, key) wait on a per-key lock
+    so the loader runs exactly once. This matters when a dashboard burst hits
+    the API before the first fetch has populated the cache.
     """
     existing = _CACHE.get(namespace, key)
     if existing is not None:
         return existing
-    try:
-        value = loader()
-    except Exception as exc:
-        if allow_stale_on_error:
-            stale = _CACHE.get(namespace, f"stale::{key}")
-            if stale is not None:
-                log.warning(
-                    "loader %s:%s failed (%s); serving stale value", namespace, key, exc
-                )
-                return stale
-        raise
-    _CACHE.set(namespace, key, value, ttl)
-    _CACHE.set(namespace, f"stale::{key}", value, timedelta(days=7))
-    return value
+
+    with _key_lock(namespace, key):
+        # recheck inside the lock — another thread may have populated the
+        # cache while we were waiting.
+        existing = _CACHE.get(namespace, key)
+        if existing is not None:
+            return existing
+
+        try:
+            value = loader()
+        except Exception as exc:
+            if allow_stale_on_error:
+                stale = _CACHE.get(namespace, f"stale::{key}")
+                if stale is not None:
+                    log.warning(
+                        "loader %s:%s failed (%s); serving stale value",
+                        namespace, key, exc,
+                    )
+                    return stale
+            raise
+        _CACHE.set(namespace, key, value, ttl)
+        _CACHE.set(namespace, f"stale::{key}", value, timedelta(days=7))
+        return value

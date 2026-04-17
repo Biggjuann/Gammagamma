@@ -87,6 +87,43 @@ def _latest_close(df: pd.DataFrame) -> Optional[float]:
     return val if val > 0 else None
 
 
+def _infer_spot_from_chain(defs, quotes_by_id) -> Optional[float]:
+    """Put-call parity approximation of spot.
+
+    C - P ≈ S - K for near-ATM, short-dated options (ignoring rates/dividends).
+    Strategy:
+      1. Pick the nearest future expiry with at least one C/P pair.
+      2. Among its strikes, take the one with the smallest |C_mid - P_mid| —
+         that's the ATM strike.
+      3. Return K + (C_mid - P_mid).
+    """
+    from collections import defaultdict
+
+    pair: dict = defaultdict(dict)
+    for d in defs:
+        q = quotes_by_id.get(d.instrument_id)
+        if not q or q.mid <= 0:
+            continue
+        pair[(d.expiration.date(), d.strike)][d.option_type] = q.mid
+
+    today = datetime.now(timezone.utc).date()
+    expiries = sorted({e for e, _ in pair if e >= today})
+    for exp in expiries:
+        best_diff = float("inf")
+        best: Optional[tuple] = None
+        for (e, k), sides in pair.items():
+            if e != exp or "C" not in sides or "P" not in sides:
+                continue
+            diff = abs(sides["C"] - sides["P"])
+            if diff < best_diff:
+                best_diff = diff
+                best = (k, sides["C"], sides["P"])
+        if best is not None:
+            k, c, p = best
+            return max(k + (c - p), 0.0)
+    return None
+
+
 def build_chain_snapshot(
     underlying: str,
     *,
@@ -98,21 +135,27 @@ def build_chain_snapshot(
     defs = client.get_chain_definitions(underlying)
     quotes = client.snapshot_nbbo(underlying)
     oi_map = client.open_interest(underlying)
-    ohlcv = client.underlying_ohlcv(underlying)
 
-    spot = _latest_close(ohlcv) or 0.0
+    now = datetime.now(timezone.utc)
+    if not defs:
+        log.warning("empty definitions for %s", underlying)
+        return ChainSnapshot(underlying, 0.0, now, [], 0.0, 0.0, 0.0, 0.0)
+    if not quotes:
+        log.warning("empty quotes for %s", underlying)
+        return ChainSnapshot(underlying, 0.0, now, [], 0.0, 0.0, 0.0, 0.0)
+
+    quotes_by_id = {q.instrument_id: q for q in quotes}
+
+    # Derive spot via put-call parity on the options we already have. Falls
+    # back to a fixture spot if parity can't be solved (no matching C/P pair).
+    spot = _infer_spot_from_chain(defs, quotes_by_id) or 0.0
     if spot <= 0:
-        # fall back to fixture spot so downstream maths stays sane
         from .fixtures import _spot  # type: ignore
 
         spot = _spot(underlying)
-
-    now = datetime.now(timezone.utc)
-    if not defs or not quotes:
-        log.warning("empty chain for %s", underlying)
-        return ChainSnapshot(underlying, spot, now, [], 0.0, 0.0, 0.0, 0.0)
-
-    quotes_by_id = {q.instrument_id: q for q in quotes}
+        log.warning("spot fallback to fixture %.2f for %s", spot, underlying)
+    else:
+        log.info("spot (put-call parity) for %s = %.2f", underlying, spot)
 
     # vectorise
     keep_defs: List = []
