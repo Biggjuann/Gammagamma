@@ -135,6 +135,16 @@ def build_chain_snapshot(
     defs = client.get_chain_definitions(underlying)
     quotes = client.snapshot_nbbo(underlying)
     oi_map = client.open_interest(underlying)
+    log.info(
+        "chain %s: %d defs, %d quotes, %d OI entries",
+        underlying, len(defs), len(quotes), len(oi_map),
+    )
+
+    # When OI fetch fails (timeouts on the big statistics stream are common
+    # on starter plans), dashboard must still show structural shape. Use
+    # placeholder OI=1 so the filter below keeps the rows and relative
+    # per-strike shape is visible; absolute $ values will be a lower bound.
+    oi_missing = not oi_map
 
     now = datetime.now(timezone.utc)
     if not defs:
@@ -192,7 +202,14 @@ def build_chain_snapshot(
     )
     mid = np.array([quotes_by_id[d.instrument_id].mid for d in keep_defs])
     is_call = np.array([d.option_type == "C" for d in keep_defs])
-    oi = np.array([oi_map.get(d.instrument_id, 0) for d in keep_defs], dtype=float)
+    if oi_missing:
+        log.warning(
+            "OI unavailable for %s — using placeholder=1 so structure still renders",
+            underlying,
+        )
+        oi = np.ones(len(keep_defs), dtype=float)
+    else:
+        oi = np.array([oi_map.get(d.instrument_id, 0) for d in keep_defs], dtype=float)
     mult = np.array([d.multiplier for d in keep_defs], dtype=float)
 
     S = np.full(K.shape, spot)
@@ -216,7 +233,11 @@ def build_chain_snapshot(
 
     rows: List[ChainRow] = []
     for i, d in enumerate(keep_defs):
-        if not valid[i] or oi[i] <= 0:
+        if not valid[i]:
+            continue
+        # When real OI is available, skip contracts with zero OI (noise).
+        # When OI is unavailable (placeholder=1), keep every priced row.
+        if not oi_missing and oi[i] <= 0:
             continue
         rows.append(
             ChainRow(
