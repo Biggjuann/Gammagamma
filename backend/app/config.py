@@ -17,7 +17,10 @@ DEFAULT_UNIVERSE = ["SPX", "SPY", "QQQ", "ES"]
 # ES is a display alias: it reuses SPY's option chain and renders strikes / spot
 # at ES scale (×10). No extra Databento fetch.
 TICKER_ALIASES = {
-    "ES": {"source": "SPY", "scale": 10.0},
+    # ES actually trades at ~SPY × 10.084 (SPX/SPY tracking delta + ES
+    # futures basis premium). The live ES=F / SPY ratio is used at query
+    # time when available; this fallback is the historical average.
+    "ES": {"source": "SPY", "scale": 10.084},
 }
 
 

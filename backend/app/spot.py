@@ -1,102 +1,136 @@
-"""Underlying spot price — live current price via Yahoo Finance.
+"""Live underlying spot — direct HTTP to free quote APIs, no SDK.
 
-Walls, flip, and GVWAP are strike points computed from yesterday's dealer
-positioning (Databento historical-only). They're fixed numbers on the
-price axis — they don't move with spot. So the most actionable dashboard
-uses **live spot** to show "where price is *right now* relative to those
-static dealer levels".
+yfinance has been consistently broken against Yahoo's current endpoints
+from data centers (returns 'Expecting value' JSON-parse errors / 403s).
+We bypass it and call two free public APIs directly:
 
-Cached 1 min (Yahoo's free tier isn't sub-second anyway).
+1. **Stooq** (primary) — CSV, no key, generally works from data centers.
+2. **Yahoo v8 chart** (backup) — JSON, no key, sometimes blocked by IP.
+
+If both fail, callers fall through to put-call parity on the chain.
 """
 from __future__ import annotations
 
+import csv
+import io
 import logging
 from datetime import timedelta
 from typing import Optional
+
+import httpx
 
 from .cache import cached_call
 
 log = logging.getLogger(__name__)
 
-try:
-    import yfinance as yf  # type: ignore
-except ImportError:  # pragma: no cover
-    yf = None  # noqa: N816
 
-
-_YAHOO_SYMBOLS = {
-    "SPX": "^GSPC",
-    "SPY": "SPY",
-    "QQQ": "QQQ",
-    "IWM": "IWM",
-    "DIA": "DIA",
-    "NDX": "^NDX",
-    "RUT": "^RUT",
-    "VIX": "^VIX",
-    "ES": "ES=F",   # E-mini S&P 500 front-month continuous future
-    "NQ": "NQ=F",   # E-mini NASDAQ-100 future
+# (stooq symbol, yahoo symbol). Either can be None to skip that source.
+_SYMBOL_MAP = {
+    "SPX":  ("^spx",    "^GSPC"),
+    "SPY":  ("spy.us",  "SPY"),
+    "QQQ":  ("qqq.us",  "QQQ"),
+    "IWM":  ("iwm.us",  "IWM"),
+    "DIA":  ("dia.us",  "DIA"),
+    "NDX":  ("^ndx",    "^NDX"),
+    "RUT":  ("^rut",    "^RUT"),
+    "VIX":  ("^vix",    "^VIX"),
+    "ES":   ("es.f",    "ES=F"),
+    "NQ":   ("nq.f",    "NQ=F"),
 }
+
+_BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0 Safari/537.36"
+)
 
 
 def get_live_spot(underlying: str) -> Optional[float]:
-    """Return the current live quote for ``underlying`` (or ``None``).
+    """Return the current live price for ``underlying`` (or ``None``).
 
-    Cached 1 minute. Returns ``None`` on failure so callers can fall
-    through to put-call parity on the chain.
+    Cached 1 minute. Tries Stooq first, Yahoo as backup.
     """
-    if yf is None:
-        log.warning("yfinance not installed; no spot for %s", underlying)
-        return None
-
-    yahoo = _YAHOO_SYMBOLS.get(underlying)
-    if yahoo is None:
+    if underlying not in _SYMBOL_MAP:
         return None
 
     return cached_call(
         namespace="spot_live",
-        key=yahoo,
+        key=underlying,
         ttl=timedelta(minutes=1),
-        loader=lambda: _fetch(yahoo),
+        loader=lambda: _fetch(underlying),
     )
 
 
-def _fetch(yahoo: str) -> Optional[float]:
-    try:
-        t = yf.Ticker(yahoo)
+def _fetch(underlying: str) -> Optional[float]:
+    stooq_sym, yahoo_sym = _SYMBOL_MAP[underlying]
 
-        # Primary: fast_info — near-real-time last trade / quote.
-        fi = getattr(t, "fast_info", None)
-        if fi is not None:
-            for attr in ("last_price", "regular_market_price", "regularMarketPrice"):
-                try:
-                    val = getattr(fi, attr, None)
-                    if val is None and hasattr(fi, "get"):
-                        val = fi.get(attr)
-                    if val and val > 0:
-                        return float(val)
-                except Exception:  # noqa: BLE001
-                    continue
+    if stooq_sym:
+        px = _fetch_stooq(stooq_sym)
+        if px is not None:
+            log.info("live spot %s = %.2f (stooq)", underlying, px)
+            return px
 
-        # Fallback: last 1-minute Close from intraday history.
-        hist = t.history(period="1d", interval="1m")
-        if hist is not None and not hist.empty and "Close" in hist.columns:
-            last = float(hist["Close"].iloc[-1])
-            if last > 0:
-                return last
+    if yahoo_sym:
+        px = _fetch_yahoo(yahoo_sym)
+        if px is not None:
+            log.info("live spot %s = %.2f (yahoo)", underlying, px)
+            return px
 
-        # Last-resort: daily Close.
-        daily = t.history(period="2d", interval="1d")
-        if daily is not None and not daily.empty and "Close" in daily.columns:
-            last = float(daily["Close"].iloc[-1])
-            if last > 0:
-                return last
-    except Exception as exc:  # noqa: BLE001
-        log.warning("yfinance fetch for %s failed: %s", yahoo, exc)
+    log.warning("all live-spot sources failed for %s", underlying)
     return None
 
 
-__all__ = ["get_live_spot"]
+def _fetch_stooq(symbol: str) -> Optional[float]:
+    url = "https://stooq.com/q/l/"
+    try:
+        r = httpx.get(
+            url,
+            params={"s": symbol, "f": "sd2t2ohlcv", "h": "", "e": "csv"},
+            headers={"User-Agent": _BROWSER_UA},
+            timeout=5.0,
+        )
+        r.raise_for_status()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("stooq fetch %s failed: %s", symbol, exc)
+        return None
 
+    try:
+        reader = csv.DictReader(io.StringIO(r.text))
+        row = next(reader, None)
+        if not row:
+            return None
+        close = row.get("Close") or row.get("close")
+        if close and close not in ("N/D", ""):
+            return float(close)
+    except (csv.Error, ValueError, StopIteration):
+        return None
+    return None
+
+
+def _fetch_yahoo(symbol: str) -> Optional[float]:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    try:
+        r = httpx.get(
+            url,
+            params={"interval": "1m", "range": "1d"},
+            headers={"User-Agent": _BROWSER_UA, "Accept": "application/json"},
+            timeout=5.0,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("yahoo fetch %s failed: %s", symbol, exc)
+        return None
+
+    try:
+        meta = data["chart"]["result"][0]["meta"]
+        for k in ("regularMarketPrice", "previousClose", "chartPreviousClose"):
+            val = meta.get(k)
+            if val and val > 0:
+                return float(val)
+    except (KeyError, IndexError, TypeError):
+        return None
+    return None
 
 
 __all__ = ["get_live_spot"]
