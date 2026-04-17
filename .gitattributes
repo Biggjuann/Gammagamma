@@ -1,0 +1,11 @@
+# Force LF line endings for everything so Railway's Linux builders
+# don't choke on CRLF shebangs when the repo is cloned via a Windows
+# client at any point.
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+Dockerfile text eol=lf
