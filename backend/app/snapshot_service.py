@@ -108,11 +108,39 @@ def _scale_snapshot(snap: ChainSnapshot, scale: float, as_underlying: str) -> Ch
     )
 
 
+def _resolve_scale(underlying: str, source: str, fallback: float) -> float:
+    """Compute the live source→alias price ratio.
+
+    A hardcoded SPY × 10 gives ES ≈ SPY × 10.0 which is off by ~0.8% vs the
+    real ES futures price (SPX ≠ 10×SPY exactly, plus ES carries a small
+    basis premium). Using the live ratio makes ES track actual /ES.
+    """
+    if underlying == source:
+        return 1.0
+    try:
+        from .spot import get_live_spot
+
+        src_spot = get_live_spot(source)
+        alias_spot = get_live_spot(underlying)
+        if src_spot and alias_spot and src_spot > 0:
+            ratio = alias_spot / src_spot
+            if 0.05 < ratio < 100:  # sanity
+                log.info(
+                    "alias scale %s/%s = %.4f (live ratio)",
+                    underlying, source, ratio,
+                )
+                return ratio
+    except Exception as exc:  # noqa: BLE001
+        log.warning("live scale for %s/%s failed: %s", underlying, source, exc)
+    return fallback
+
+
 def _build(underlying: str, expiry_filter: Optional[str]) -> Bundle:
     # resolve aliases (e.g. ES → fetch SPY, display at ES scale)
     alias = TICKER_ALIASES.get(underlying)
     source = alias["source"] if alias else underlying
-    scale = alias["scale"] if alias else 1.0
+    fallback_scale = alias["scale"] if alias else 1.0
+    scale = _resolve_scale(underlying, source, fallback_scale)
 
     snap: ChainSnapshot = build_chain_snapshot(source, expiry_filter=expiry_filter)
     if scale != 1.0:

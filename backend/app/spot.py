@@ -33,6 +33,8 @@ _YAHOO_SYMBOLS = {
     "NDX": "^NDX",
     "RUT": "^RUT",
     "VIX": "^VIX",
+    "ES": "ES=F",   # E-mini S&P 500 front-month continuous future
+    "NQ": "NQ=F",   # E-mini NASDAQ-100 future
 }
 
 
