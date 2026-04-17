@@ -189,14 +189,17 @@ class DatabentoClient:
                 return _fixture_oi(underlying)
             parent = _parent_symbol(underlying)
             log.info("databento fetch: statistics symbol=%s day=%s", parent, day)
+            # OI is published after the cash close. Narrow the window to
+            # 20:00-23:00 UTC so we don't pull the full day's statistics
+            # stream (can be multi-GB per ticker).
             try:
                 data = self._client.timeseries.get_range(  # type: ignore[union-attr]
                     dataset=self.dataset,
                     schema="statistics",
                     symbols=[parent],
                     stype_in="parent",
-                    start=f"{day}T00:00:00",
-                    end=f"{day}T23:59:59",
+                    start=f"{day}T20:00:00",
+                    end=f"{day}T23:00:00",
                 )
                 df = data.to_df()
             except Exception as exc:  # noqa: BLE001
