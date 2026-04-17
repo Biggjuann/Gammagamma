@@ -132,7 +132,21 @@ def ticker(
     if sym not in get_settings().universe:
         raise HTTPException(404, f"{sym} not in universe")
     flt = None if expiry in (None, "all") else expiry
-    return get_bundle(sym, expiry_filter=flt).to_json()
+    try:
+        return get_bundle(sym, expiry_filter=flt).to_json()
+    except Exception as exc:  # noqa: BLE001
+        log.exception("ticker %s build failed: %s", sym, exc)
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": type(exc).__name__,
+                "message": str(exc),
+                "symbol": sym,
+                "hint": "Check backend logs. Common causes: Databento auth, "
+                "symbology (SPX options may need a different parent symbol), "
+                "or OPRA historical lag during market hours.",
+            },
+        )
 
 
 @app.post("/api/cache/reset")

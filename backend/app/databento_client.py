@@ -100,22 +100,29 @@ class DatabentoClient:
         self, underlying: str, asof: Optional[datetime] = None
     ) -> List[OptionDefinition]:
         asof = asof or datetime.now(timezone.utc)
-        day = asof.date().isoformat()
+        # OPRA historical has ~15-30 min lag; use previous trading day for
+        # definitions to guarantee the record is available.
+        day = _previous_business_day(asof).isoformat()
         key = f"{self.dataset}:{underlying}:{day}"
 
         def _load() -> List[OptionDefinition]:
             if not self._has_key:
                 return _fixture_definitions(underlying)
-            # parent symbology pulls the full chain in a single call
+            parent = _parent_symbol(underlying)
+            log.info(
+                "databento fetch: definition dataset=%s symbol=%s day=%s",
+                self.dataset, parent, day,
+            )
             data = self._client.timeseries.get_range(  # type: ignore[union-attr]
                 dataset=self.dataset,
                 schema="definition",
-                symbols=[f"{underlying}.OPT"],
+                symbols=[parent],
                 stype_in="parent",
                 start=f"{day}T00:00:00",
                 end=f"{day}T23:59:59",
             )
             df = data.to_df()
+            log.info("databento fetched %d definition rows for %s", len(df), parent)
             return _rows_to_definitions(df, underlying)
 
         return cached_call(
@@ -139,19 +146,27 @@ class DatabentoClient:
         def _load() -> List[Quote]:
             if not self._has_key:
                 return _fixture_quotes(underlying)
-            # tiny tick-stream window — enough for a point-in-time NBBO without
-            # paying for a full minute of tape.
+            parent = _parent_symbol(underlying)
             window = get_settings().cmbp_window_seconds
+            # OPRA historical is delayed ~30 min. Shift the query back so we
+            # hit settled data instead of the edge of the stream.
+            end = asof - timedelta(minutes=30)
+            start = end - timedelta(seconds=window)
+            log.info(
+                "databento fetch: cmbp-1 dataset=%s symbol=%s window=%ss end=%s",
+                self.dataset, parent, window, end.isoformat(),
+            )
             data = self._client.timeseries.get_range(  # type: ignore[union-attr]
                 dataset=self.dataset,
                 schema="cmbp-1",
-                symbols=[f"{underlying}.OPT"],
+                symbols=[parent],
                 stype_in="parent",
-                start=(asof - timedelta(seconds=window)).isoformat(),
-                end=asof.isoformat(),
+                start=start.isoformat(),
+                end=end.isoformat(),
                 limit=200_000,
             )
             df = data.to_df()
+            log.info("databento fetched %d cmbp-1 rows for %s", len(df), parent)
             return _rows_to_quotes(df)
 
         return cached_call(
@@ -171,16 +186,19 @@ class DatabentoClient:
         def _load() -> dict[int, int]:
             if not self._has_key:
                 return _fixture_oi(underlying)
+            parent = _parent_symbol(underlying)
+            log.info("databento fetch: statistics (OI) symbol=%s day=%s", parent, day)
             data = self._client.timeseries.get_range(  # type: ignore[union-attr]
                 dataset=self.dataset,
                 schema="statistics",
-                symbols=[f"{underlying}.OPT"],
+                symbols=[parent],
                 stype_in="parent",
                 start=f"{day}T00:00:00",
                 end=f"{day}T12:00:00",
             )
             df = data.to_df()
             if df.empty:
+                log.warning("databento OI empty for %s on %s", parent, day)
                 return {}
             oi = df[df["stat_type"] == 9]  # 9 = open interest
             return dict(zip(oi["instrument_id"].astype(int), oi["quantity"].astype(int)))
@@ -255,6 +273,28 @@ class DatabentoClient:
 # ---------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------
+# Some underlyings need a non-default parent symbol. Index options (SPX, NDX,
+# RUT, VIX) trade on their own CBOE roots that differ from the ticker.
+_PARENT_SYMBOL_OVERRIDES = {
+    # SPX index options use the SPX parent on OPRA already, but some feeds
+    # route through SPXW (weeklys). Database override hook left intentionally
+    # permissive; most tickers just take ``{sym}.OPT``.
+}
+
+
+def _parent_symbol(underlying: str) -> str:
+    return _PARENT_SYMBOL_OVERRIDES.get(underlying, f"{underlying}.OPT")
+
+
+def _previous_business_day(dt: datetime):
+    d = dt.date()
+    while True:
+        d = d - timedelta(days=1)
+        if d.weekday() < 5:  # Mon-Fri
+            return d
+
+
+
 def _rows_to_definitions(df: pd.DataFrame, underlying: str) -> List[OptionDefinition]:
     defs: List[OptionDefinition] = []
     if df is None or df.empty:
