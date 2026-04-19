@@ -117,6 +117,25 @@ def cache() -> TTLCache:
     return _CACHE
 
 
+def _is_empty(value: Any) -> bool:
+    """Treat empty collections / empty DataFrames as failed fetches.
+
+    Swallowed errors inside loaders typically return empty — caching those
+    for the full TTL poisons the cache. We skip caching empties so the
+    next request retries.
+    """
+    if value is None:
+        return True
+    if hasattr(value, "empty"):  # pandas DataFrame / Series
+        try:
+            return bool(value.empty)
+        except Exception:  # noqa: BLE001
+            return False
+    if isinstance(value, (list, tuple, set, dict, str)):
+        return len(value) == 0
+    return False
+
+
 def cached_call(
     namespace: str,
     key: str,
@@ -124,22 +143,25 @@ def cached_call(
     loader: Callable[[], Any],
     *,
     allow_stale_on_error: bool = True,
+    cache_empty: bool = False,
 ) -> Any:
     """Run ``loader`` only if the cache misses. Serialise concurrent misses.
 
     Concurrent requests for the same (namespace, key) wait on a per-key lock
     so the loader runs exactly once. This matters when a dashboard burst hits
     the API before the first fetch has populated the cache.
+
+    Empty results are NOT cached by default (``cache_empty=False``) because
+    loaders commonly return an empty collection on transient failure — we
+    want the next call to retry rather than serve stale empties for hours.
     """
     existing = _CACHE.get(namespace, key)
-    if existing is not None:
+    if existing is not None and not _is_empty(existing):
         return existing
 
     with _key_lock(namespace, key):
-        # recheck inside the lock — another thread may have populated the
-        # cache while we were waiting.
         existing = _CACHE.get(namespace, key)
-        if existing is not None:
+        if existing is not None and not _is_empty(existing):
             return existing
 
         try:
@@ -147,13 +169,21 @@ def cached_call(
         except Exception as exc:
             if allow_stale_on_error:
                 stale = _CACHE.get(namespace, f"stale::{key}")
-                if stale is not None:
+                if stale is not None and not _is_empty(stale):
                     log.warning(
                         "loader %s:%s failed (%s); serving stale value",
                         namespace, key, exc,
                     )
                     return stale
             raise
+
+        if _is_empty(value) and not cache_empty:
+            log.info(
+                "loader %s:%s returned empty; skipping cache so next call retries",
+                namespace, key,
+            )
+            return value
+
         _CACHE.set(namespace, key, value, ttl)
         _CACHE.set(namespace, f"stale::{key}", value, timedelta(days=7))
         return value

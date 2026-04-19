@@ -152,19 +152,17 @@ class DatabentoClient:
             log.info(
                 "databento fetch: cbbo-1m symbol=%s end=%s", parent, end.isoformat(),
             )
-            try:
-                data = self._client.timeseries.get_range(  # type: ignore[union-attr]
-                    dataset=self.dataset,
-                    schema="cbbo-1m",
-                    symbols=[parent],
-                    stype_in="parent",
-                    start=start.isoformat(),
-                    end=end.isoformat(),
-                )
-                df = data.to_df()
-            except Exception as exc:  # noqa: BLE001
-                log.exception("cbbo-1m fetch failed for %s: %s", parent, exc)
-                return []
+            # Let exceptions bubble up — cached_call won't cache empties and
+            # allow_stale_on_error will fall back to the last good snapshot.
+            data = self._client.timeseries.get_range(  # type: ignore[union-attr]
+                dataset=self.dataset,
+                schema="cbbo-1m",
+                symbols=[parent],
+                stype_in="parent",
+                start=start.isoformat(),
+                end=end.isoformat(),
+            )
+            df = data.to_df()
             quotes = _rows_to_quotes(df)
             log.info(
                 "databento %s: %d cbbo-1m rows → %d quotes",
