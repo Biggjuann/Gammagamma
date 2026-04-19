@@ -201,18 +201,51 @@ class DatabentoClient:
                 )
                 df = data.to_df()
             except Exception as exc:  # noqa: BLE001
-                log.exception("OI fetch failed for %s: %s", parent, exc)
+                log.warning("OI statistics failed for %s: %s", parent, exc)
+                df = None
+            if df is not None and not df.empty and "stat_type" in df.columns:
+                try:
+                    oi = df[df["stat_type"] == 9]
+                    if not oi.empty:
+                        return dict(
+                            zip(
+                                oi["instrument_id"].astype(int),
+                                oi["quantity"].astype(int),
+                            )
+                        )
+                except (KeyError, ValueError):
+                    pass
+
+            # Fallback: daily volume per instrument via ohlcv-1d. Much smaller
+            # than the statistics stream, still gives a reasonable distribution
+            # across strikes so call/put walls diverge.
+            log.info(
+                "OI empty for %s — falling back to ohlcv-1d daily volume", parent,
+            )
+            try:
+                data = self._client.timeseries.get_range(  # type: ignore[union-attr]
+                    dataset=self.dataset,
+                    schema="ohlcv-1d",
+                    symbols=[parent],
+                    stype_in="parent",
+                    start=f"{day}T00:00:00",
+                    end=f"{day}T23:59:59",
+                )
+                df = data.to_df()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("ohlcv-1d fallback failed for %s: %s", parent, exc)
                 return {}
             if df is None or df.empty:
-                log.warning("OI empty for %s on %s", parent, day)
                 return {}
-            if "stat_type" not in df.columns:
-                log.warning("OI schema missing stat_type for %s", parent)
+            df = df.reset_index()
+            if "instrument_id" not in df.columns or "volume" not in df.columns:
                 return {}
-            oi = df[df["stat_type"] == 9]  # 9 = open interest
             try:
                 return dict(
-                    zip(oi["instrument_id"].astype(int), oi["quantity"].astype(int))
+                    zip(
+                        df["instrument_id"].astype(int),
+                        df["volume"].astype(int),
+                    )
                 )
             except (KeyError, ValueError):
                 return {}
