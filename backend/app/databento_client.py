@@ -96,7 +96,11 @@ class DatabentoClient:
         self, underlying: str, asof: Optional[datetime] = None
     ) -> List[OptionDefinition]:
         asof = asof or datetime.now(timezone.utc)
-        day = _previous_business_day(asof).isoformat()
+        day = (
+            _working_query_day(self._client).isoformat()
+            if self._has_key
+            else _previous_business_day(asof).isoformat()
+        )
         key = f"{self.dataset}:{underlying}:{day}"
 
         def _load() -> List[OptionDefinition]:
@@ -179,7 +183,11 @@ class DatabentoClient:
 
     # -- open interest -------------------------------------------------
     def open_interest(self, underlying: str) -> Dict[int, int]:
-        day = _previous_business_day(datetime.now(timezone.utc)).isoformat()
+        day = (
+            _working_query_day(self._client).isoformat()
+            if self._has_key
+            else _previous_business_day(datetime.now(timezone.utc)).isoformat()
+        )
         key = f"{self.dataset}:{underlying}:{day}"
 
         def _load() -> Dict[int, int]:
@@ -334,13 +342,73 @@ def _previous_business_day(dt: datetime) -> date:
             return d
 
 
-def _last_settled_close(asof: datetime) -> datetime:
-    """Previous business day at 20:00 UTC (~16:00 ET US cash close).
+def _nth_business_day_back(dt: datetime, n: int) -> date:
+    """Return the date that is ``n`` business days before ``dt``."""
+    d = dt.date()
+    count = 0
+    while count < n:
+        d = d - timedelta(days=1)
+        if d.weekday() < 5:
+            count += 1
+    return d
 
-    Always inside a historical licence window, and the structural levels at
-    cash close are what the AM / PM dashboard snapshots need anyway.
+
+# Cached result of probing for a date Databento lets us query. The licence
+# boundary message is inconsistent, so we empirically find a working date
+# once and reuse it all day.
+_WORKING_DAY_CACHE: Dict[str, date] = {}
+
+
+def _working_query_day(client) -> date:
+    """Find the most recent business day the licence accepts."""
+    today_key = datetime.now(timezone.utc).date().isoformat()
+    if today_key in _WORKING_DAY_CACHE:
+        return _WORKING_DAY_CACHE[today_key]
+
+    now = datetime.now(timezone.utc)
+    for n in range(1, 10):  # try up to 10 business days back
+        day = _nth_business_day_back(now, n)
+        try:
+            probe = client.timeseries.get_range(
+                dataset="OPRA.PILLAR",
+                schema="definition",
+                symbols=["SPY.OPT"],
+                stype_in="parent",
+                start=f"{day}T10:00:00",
+                end=f"{day}T10:00:30",
+                limit=10,
+            )
+            _ = probe.to_df()
+            log.info("probe OK: databento accepts day=%s", day)
+            _WORKING_DAY_CACHE[today_key] = day
+            return day
+        except Exception as exc:  # noqa: BLE001
+            log.warning("probe day=%s rejected: %s", day, exc)
+            continue
+
+    # All probes failed — return the most recent business day as a last
+    # resort so callers fail with a specific error instead of looping.
+    fallback = _previous_business_day(now)
+    log.error("no working databento day found; using %s", fallback)
+    return fallback
+
+
+def _last_settled_close(asof: datetime) -> datetime:
+    """Last business-day cash close in UTC that the Databento licence accepts.
+
+    Uses ``_working_query_day`` if a live client is available so NBBO, trades,
+    and statistics all target the same vetted date.
     """
-    d = _previous_business_day(asof)
+    from .databento_client import _working_query_day  # late import
+
+    client = get_client()._client  # type: ignore[attr-defined]
+    if client is not None:
+        try:
+            d = _working_query_day(client)
+        except Exception:  # noqa: BLE001
+            d = _previous_business_day(asof)
+    else:
+        d = _previous_business_day(asof)
     return datetime(d.year, d.month, d.day, 20, 0, 0, tzinfo=timezone.utc)
 
 
