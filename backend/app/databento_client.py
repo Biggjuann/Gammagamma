@@ -360,13 +360,19 @@ _WORKING_DAY_CACHE: Dict[str, date] = {}
 
 
 def _working_query_day(client) -> date:
-    """Find the most recent business day the licence accepts."""
+    """Find the most recent business day whose full session is licensed.
+
+    Probes with an end time of 23:59 — the latest any of our real queries
+    goes. A date only qualifies if that end is inside Databento's licence
+    window, otherwise cbbo-1m (end=20:00) and statistics (end=23:00)
+    would 403 later.
+    """
     today_key = datetime.now(timezone.utc).date().isoformat()
     if today_key in _WORKING_DAY_CACHE:
         return _WORKING_DAY_CACHE[today_key]
 
     now = datetime.now(timezone.utc)
-    for n in range(1, 10):  # try up to 10 business days back
+    for n in range(1, 10):
         day = _nth_business_day_back(now, n)
         try:
             probe = client.timeseries.get_range(
@@ -374,21 +380,21 @@ def _working_query_day(client) -> date:
                 schema="definition",
                 symbols=["SPY.OPT"],
                 stype_in="parent",
-                start=f"{day}T10:00:00",
-                end=f"{day}T10:00:30",
+                start=f"{day}T23:00:00",
+                end=f"{day}T23:59:59",
                 limit=10,
             )
             _ = probe.to_df()
-            log.info("probe OK: databento accepts day=%s", day)
+            log.info(
+                "probe OK: databento accepts full-day range for %s", day,
+            )
             _WORKING_DAY_CACHE[today_key] = day
             return day
         except Exception as exc:  # noqa: BLE001
-            log.warning("probe day=%s rejected: %s", day, exc)
+            log.warning("probe full-day for %s rejected: %s", day, exc)
             continue
 
-    # All probes failed — return the most recent business day as a last
-    # resort so callers fail with a specific error instead of looping.
-    fallback = _previous_business_day(now)
+    fallback = _nth_business_day_back(now, 2)
     log.error("no working databento day found; using %s", fallback)
     return fallback
 
