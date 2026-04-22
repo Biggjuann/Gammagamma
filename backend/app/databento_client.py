@@ -595,8 +595,15 @@ _CLIENT: Optional[object] = None
 def get_client():
     """Return the active chain client.
 
-    Default source is Yahoo (free, no key). Set ``DATA_SOURCE=databento`` in
-    the environment to route through the Databento client instead.
+    Default source is Yahoo (free, no key). Set ``DATA_SOURCE`` in the
+    environment to switch:
+
+      * ``DATA_SOURCE=marketdata`` → marketdata.app (requires
+        ``MARKETDATA_TOKEN``).
+      * ``DATA_SOURCE=databento``  → Databento OPRA.PILLAR (requires
+        ``DATABENTO_API_KEY``).
+      * ``DATA_SOURCE=yahoo`` / unset → Yahoo Finance options (free,
+        frequently IP-blocked from data centers).
     """
     global _CLIENT
     if _CLIENT is None:
@@ -606,6 +613,11 @@ def get_client():
         if source == "databento":
             _CLIENT = DatabentoClient()
             log.info("chain source: Databento (OPRA.PILLAR)")
+        elif source == "marketdata":
+            from .marketdata_chain import MarketdataChainClient
+
+            _CLIENT = MarketdataChainClient()
+            log.info("chain source: marketdata.app")
         else:
             from .yahoo_chain import YahooChainClient
 
