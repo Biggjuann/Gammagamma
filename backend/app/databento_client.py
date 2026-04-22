@@ -195,9 +195,9 @@ class DatabentoClient:
                 return _fixture_oi(underlying)
             parent = _parent_symbol(underlying)
             log.info("databento fetch: statistics symbol=%s day=%s", parent, day)
-            # OI is published after the cash close. Narrow the window to
-            # 20:00-23:00 UTC so we don't pull the full day's statistics
-            # stream (can be multi-GB per ticker).
+            # End-of-day Open Interest publishes at/just after the cash close.
+            # A narrow 10-minute window captures the EOD OI record and keeps
+            # the statistics stream under a few hundred MB instead of 5 GB.
             try:
                 data = self._client.timeseries.get_range(  # type: ignore[union-attr]
                     dataset=self.dataset,
@@ -205,7 +205,7 @@ class DatabentoClient:
                     symbols=[parent],
                     stype_in="parent",
                     start=f"{day}T20:00:00",
-                    end=f"{day}T23:00:00",
+                    end=f"{day}T20:10:00",
                 )
                 df = data.to_df()
             except Exception as exc:  # noqa: BLE001
@@ -213,8 +213,13 @@ class DatabentoClient:
                 df = None
             if df is not None and not df.empty and "stat_type" in df.columns:
                 try:
-                    oi = df[df["stat_type"] == 9]
+                    # Databento StatType.OPEN_INTEREST == 14
+                    oi = df[df["stat_type"] == 14]
                     if not oi.empty:
+                        log.info(
+                            "OI for %s: %d contracts from EOD statistics",
+                            parent, len(oi),
+                        )
                         return dict(
                             zip(
                                 oi["instrument_id"].astype(int),
