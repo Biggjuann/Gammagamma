@@ -136,14 +136,16 @@ def _fetch_chain(
         )
         return _fetch_single_expiry(sym, headers, expiration=None, underlying=underlying)
 
-    # 2. Pick ~8 evenly-spaced expiries.
+    # 2. Pick a small set of expiries. marketdata.app's free tier
+    #    has a tight burst limit (~6-8 calls before 429), so we keep
+    #    per-ticker calls low: 0DTE / +7d / +30d / +90d.
     targets = _pick_target_expiries(exp_list)
     log.info(
         "marketdata %s: pulling %d of %d expiries: %s",
         underlying, len(targets), len(exp_list), targets,
     )
 
-    # 3. Fetch each, merge.
+    # 3. Fetch each with generous pacing to stay under burst limits.
     all_defs: List[OptionDefinition] = []
     all_quotes: List[Quote] = []
     all_oi: Dict[int, int] = {}
@@ -155,7 +157,7 @@ def _fetch_chain(
         all_defs.extend(defs)
         all_quotes.extend(quotes)
         all_oi.update(oi)
-        time.sleep(0.2)  # polite pacing to stay friendly with rate limits
+        time.sleep(1.0)  # 1s between calls — keeps us below burst threshold
 
     exps_seen = len({d.expiration.date().isoformat() for d in all_defs})
     log.info(
@@ -166,23 +168,35 @@ def _fetch_chain(
 
 
 def _fetch_expirations(sym: str, headers: dict) -> List[str]:
-    """Return the symbol's available expiry list as YYYY-MM-DD strings."""
-    url = f"{_MD_BASE}/options/expirations/{sym}/"
-    data = _http_get_json(url, headers, timeout=15.0)
-    if data is None or data.get("s") != "ok":
-        return []
-    return [str(e) for e in (data.get("expirations") or [])]
+    """Return the symbol's available expiry list as YYYY-MM-DD strings.
+
+    Cached 24h since listed expirations only change at expiration rolls.
+    """
+
+    def _load() -> List[str]:
+        url = f"{_MD_BASE}/options/expirations/{sym}/"
+        data = _http_get_json(url, headers, timeout=15.0)
+        if data is None or data.get("s") != "ok":
+            return []
+        return [str(e) for e in (data.get("expirations") or [])]
+
+    return cached_call(
+        namespace="md_expirations",
+        key=sym,
+        ttl=timedelta(hours=24),
+        loader=_load,
+    )
 
 
 def _pick_target_expiries(all_exps: List[str]) -> List[str]:
-    """Pick ~8 strategically-spaced expiries matching real listed dates.
+    """Pick ~4 strategically-spaced expiries.
 
-    Targets: 0DTE, +1w, +2w, +1M, +2M, +3M, +6M, +1Y. For each target we
-    pick the listed expiry closest to that date. Duplicates are deduped,
-    so a symbol with sparse expiries may return fewer than 8.
+    Targets: 0DTE, +7d, +30d, +90d — covers 0DTE / weekly / monthly /
+    leaps-ish. Fewer targets keeps us inside marketdata's free-tier
+    burst limit.
     """
     today = date.today()
-    target_dtes = [0, 7, 14, 30, 60, 90, 180, 365]
+    target_dtes = [0, 7, 30, 90]
 
     parsed: List[Tuple[str, date]] = []
     for e in all_exps:
@@ -212,7 +226,11 @@ def _fetch_single_expiry(
     underlying: str,
 ) -> Tuple[List[OptionDefinition], List[Quote], Dict[int, int]]:
     url = f"{_MD_BASE}/options/chain/{sym}/"
-    params = {"expiration": expiration} if expiration else None
+    # feed=cached uses EOD-cached data which has looser rate limits than
+    # live. Fine for our twice-daily snapshot cadence.
+    params = {"feed": "cached"}
+    if expiration:
+        params["expiration"] = expiration
 
     data = _http_get_json(url, headers, timeout=60.0, params=params)
     if data is None:
