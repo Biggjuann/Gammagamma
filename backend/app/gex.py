@@ -132,6 +132,8 @@ def build_chain_snapshot(
     settings = get_settings()
     client = get_client()
 
+    from .spot import get_live_spot
+
     defs = client.get_chain_definitions(underlying)
     quotes = client.snapshot_nbbo(underlying)
     oi_map = client.open_interest(underlying)
@@ -147,12 +149,16 @@ def build_chain_snapshot(
     oi_missing = not oi_map
 
     now = datetime.now(timezone.utc)
+    # Always attempt to resolve spot — dashboard should at least show price
+    # even when the chain source is returning nothing.
+    fallback_spot = get_live_spot(underlying) or 0.0
+
     if not defs:
         log.warning("empty definitions for %s", underlying)
-        return ChainSnapshot(underlying, 0.0, now, [], 0.0, 0.0, 0.0, 0.0)
+        return ChainSnapshot(underlying, fallback_spot, now, [], 0.0, 0.0, 0.0, 0.0)
     if not quotes:
         log.warning("empty quotes for %s", underlying)
-        return ChainSnapshot(underlying, 0.0, now, [], 0.0, 0.0, 0.0, 0.0)
+        return ChainSnapshot(underlying, fallback_spot, now, [], 0.0, 0.0, 0.0, 0.0)
 
     quotes_by_id = {q.instrument_id: q for q in quotes}
 
