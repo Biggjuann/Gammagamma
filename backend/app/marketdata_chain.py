@@ -226,13 +226,27 @@ def _fetch_single_expiry(
     underlying: str,
 ) -> Tuple[List[OptionDefinition], List[Quote], Dict[int, int]]:
     url = f"{_MD_BASE}/options/chain/{sym}/"
-    params: dict = {}
+    # CRITICAL credit-saver: marketdata.app charges per symbol in the
+    # response when bid/ask/mid/last columns are present. Without filters
+    # a full SPY chain can be ~300 credits per expiry; with these filters
+    # ~30. Docs: https://www.marketdata.app/docs/api/rate-limiting
+    params: dict = {
+        "strikeLimit": "100",        # ±100 strikes around ATM (covers walls)
+        "mode": "cached",            # EOD-cached quotes: cheaper on paid plans
+    }
     if expiration:
         params["expiration"] = expiration
 
     data = _http_get_json(url, headers, timeout=60.0, params=params)
     if data is None:
         data = _http_get_json(url, headers, timeout=90.0, params=params)
+    if data is None:
+        # mode=cached isn't available on Starter Trial / Trader Trial. If the
+        # first attempt returned None (including a hypothetical 402), retry
+        # without mode=cached.
+        params.pop("mode", None)
+        log.info("marketdata %s (exp=%s): retrying without mode=cached", sym, expiration)
+        data = _http_get_json(url, headers, timeout=60.0, params=params)
     if data is None:
         return [], [], {}
 
