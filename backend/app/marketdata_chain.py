@@ -1,21 +1,24 @@
 """marketdata.app options-chain source.
 
-Free tier: 100 requests/day. One call per underlying returns the full
-chain with strike, expiry, type, bid/ask, last, open interest, volume,
-IV and full greeks. That means at 2 scheduled snapshots/day × 3 tickers
-we use 6 requests/day — well inside the free quota.
+Free tier: 100 requests/day. We pull ~8 strategically-spaced expiries per
+underlying (0DTE, +1w, +2w, +1M, +2M, +3M, +6M, +1Y) so the dashboard's
+Expiry filter buttons (0DTE / Weekly / Monthly / LEAPS) all light up.
+
+Per-snapshot budget per underlying: 1 expirations call + ~8 chain calls
+= ~9 requests. 3 tickers × 2 scheduled snapshots/day = ~54 requests/day,
+inside the free 100/day quota.
 
 API reference: https://www.marketdata.app/docs/api/options/chain
-
-Auth: Bearer token in ``Authorization`` header. Token is read from the
-``MARKETDATA_TOKEN`` env var so it never touches the repo.
+Auth: Bearer token in ``Authorization`` header; token read from the
+``MARKETDATA_TOKEN`` env var.
 """
 from __future__ import annotations
 
 import hashlib
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+import time
+from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import httpx
@@ -119,44 +122,115 @@ def _fetch_chain(
     underlying: str, token: str
 ) -> Tuple[List[OptionDefinition], List[Quote], Dict[int, int]]:
     sym = _marketdata_symbol(underlying)
-    url = f"{_MD_BASE}/options/chain/{sym}/"
     headers = {
         "Authorization": f"Token {token}",
         "Accept": "application/json",
     }
 
-    # SPY has 10k+ contracts; the default 20s isn't enough for their
-    # endpoint to serialize and return. Bump high and retry once.
-    data = _http_get_json(url, headers, timeout=60.0)
+    # 1. Get the full list of available expirations.
+    exp_list = _fetch_expirations(sym, headers)
+    if not exp_list:
+        log.warning(
+            "marketdata %s: expirations endpoint empty; falling back to default chain call",
+            sym,
+        )
+        return _fetch_single_expiry(sym, headers, expiration=None, underlying=underlying)
+
+    # 2. Pick ~8 evenly-spaced expiries.
+    targets = _pick_target_expiries(exp_list)
+    log.info(
+        "marketdata %s: pulling %d of %d expiries: %s",
+        underlying, len(targets), len(exp_list), targets,
+    )
+
+    # 3. Fetch each, merge.
+    all_defs: List[OptionDefinition] = []
+    all_quotes: List[Quote] = []
+    all_oi: Dict[int, int] = {}
+
+    for exp in targets:
+        defs, quotes, oi = _fetch_single_expiry(
+            sym, headers, expiration=exp, underlying=underlying
+        )
+        all_defs.extend(defs)
+        all_quotes.extend(quotes)
+        all_oi.update(oi)
+        time.sleep(0.2)  # polite pacing to stay friendly with rate limits
+
+    exps_seen = len({d.expiration.date().isoformat() for d in all_defs})
+    log.info(
+        "marketdata %s merged: %d contracts across %d expiries",
+        underlying, len(all_defs), exps_seen,
+    )
+    return all_defs, all_quotes, all_oi
+
+
+def _fetch_expirations(sym: str, headers: dict) -> List[str]:
+    """Return the symbol's available expiry list as YYYY-MM-DD strings."""
+    url = f"{_MD_BASE}/options/expirations/{sym}/"
+    data = _http_get_json(url, headers, timeout=15.0)
+    if data is None or data.get("s") != "ok":
+        return []
+    return [str(e) for e in (data.get("expirations") or [])]
+
+
+def _pick_target_expiries(all_exps: List[str]) -> List[str]:
+    """Pick ~8 strategically-spaced expiries matching real listed dates.
+
+    Targets: 0DTE, +1w, +2w, +1M, +2M, +3M, +6M, +1Y. For each target we
+    pick the listed expiry closest to that date. Duplicates are deduped,
+    so a symbol with sparse expiries may return fewer than 8.
+    """
+    today = date.today()
+    target_dtes = [0, 7, 14, 30, 60, 90, 180, 365]
+
+    parsed: List[Tuple[str, date]] = []
+    for e in all_exps:
+        try:
+            parsed.append((e, date.fromisoformat(e[:10])))
+        except (ValueError, TypeError):
+            continue
+    if not parsed:
+        return []
+    parsed.sort(key=lambda x: x[1])
+
+    selected = []
+    seen = set()
+    for dte in target_dtes:
+        goal = today + timedelta(days=dte)
+        closest = min(parsed, key=lambda x: abs((x[1] - goal).days))
+        if closest[0] not in seen:
+            seen.add(closest[0])
+            selected.append(closest[0])
+    return sorted(selected)
+
+
+def _fetch_single_expiry(
+    sym: str,
+    headers: dict,
+    expiration: Optional[str],
+    underlying: str,
+) -> Tuple[List[OptionDefinition], List[Quote], Dict[int, int]]:
+    url = f"{_MD_BASE}/options/chain/{sym}/"
+    params = {"expiration": expiration} if expiration else None
+
+    data = _http_get_json(url, headers, timeout=60.0, params=params)
     if data is None:
-        log.warning("marketdata fetch %s returned None; retrying once", sym)
-        data = _http_get_json(url, headers, timeout=90.0)
+        # one retry with longer timeout for large chains
+        data = _http_get_json(url, headers, timeout=90.0, params=params)
     if data is None:
         return [], [], {}
 
     if data.get("s") != "ok":
         log.warning(
-            "marketdata %s returned non-ok status: s=%s errmsg=%s",
-            sym, data.get("s"), data.get("errmsg"),
+            "marketdata %s (exp=%s) non-ok: s=%s errmsg=%s",
+            sym, expiration, data.get("s"), data.get("errmsg"),
         )
         return [], [], {}
 
     n = len(data.get("optionSymbol", []))
     if n == 0:
-        log.warning("marketdata %s returned zero contracts", sym)
         return [], [], {}
-
-    # Diagnostic: how many distinct expiries did we get?
-    exps = set()
-    for ts in data.get("expiration", []):
-        try:
-            exps.add(int(ts))
-        except (TypeError, ValueError):
-            continue
-    log.info(
-        "marketdata chain %s: %d contracts across %d expiries",
-        underlying, n, len(exps),
-    )
 
     defs: List[OptionDefinition] = []
     quotes: List[Quote] = []
@@ -215,20 +289,20 @@ def _fetch_chain(
     return defs, quotes, oi_map
 
 
-def _http_get_json(url: str, headers: dict, timeout: float) -> Optional[dict]:
+def _http_get_json(
+    url: str, headers: dict, timeout: float, params: Optional[dict] = None
+) -> Optional[dict]:
     try:
-        r = httpx.get(url, headers=headers, timeout=timeout)
+        r = httpx.get(url, headers=headers, params=params or {}, timeout=timeout)
     except httpx.TimeoutException as exc:
-        log.warning("marketdata timeout after %.0fs: %s", timeout, exc)
+        log.warning("marketdata timeout after %.0fs (%s): %s", timeout, url, exc)
         return None
     except Exception as exc:  # noqa: BLE001
-        log.warning("marketdata request failed: %s", exc)
+        log.warning("marketdata request failed (%s): %s", url, exc)
         return None
 
     if r.status_code == 401:
-        log.error(
-            "marketdata 401 — check MARKETDATA_TOKEN (got: %s)", r.text[:200],
-        )
+        log.error("marketdata 401 — check MARKETDATA_TOKEN (got: %s)", r.text[:200])
         return None
     if r.status_code == 429:
         log.warning("marketdata 429 — over free-tier quota for today")
