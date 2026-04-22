@@ -125,21 +125,13 @@ def _fetch_chain(
         "Accept": "application/json",
     }
 
-    try:
-        r = httpx.get(url, headers=headers, timeout=20.0)
-        if r.status_code == 401:
-            log.error(
-                "marketdata.app 401 — check MARKETDATA_TOKEN (got response: %s)",
-                r.text[:200],
-            )
-            return [], [], {}
-        if r.status_code == 429:
-            log.warning("marketdata.app 429 — over free-tier quota for today")
-            return [], [], {}
-        r.raise_for_status()
-        data = r.json()
-    except Exception as exc:  # noqa: BLE001
-        log.warning("marketdata fetch %s failed: %s", sym, exc)
+    # SPY has 10k+ contracts; the default 20s isn't enough for their
+    # endpoint to serialize and return. Bump high and retry once.
+    data = _http_get_json(url, headers, timeout=60.0)
+    if data is None:
+        log.warning("marketdata fetch %s returned None; retrying once", sym)
+        data = _http_get_json(url, headers, timeout=90.0)
+    if data is None:
         return [], [], {}
 
     if data.get("s") != "ok":
@@ -154,7 +146,17 @@ def _fetch_chain(
         log.warning("marketdata %s returned zero contracts", sym)
         return [], [], {}
 
-    log.info("marketdata chain %s: %d contracts", underlying, n)
+    # Diagnostic: how many distinct expiries did we get?
+    exps = set()
+    for ts in data.get("expiration", []):
+        try:
+            exps.add(int(ts))
+        except (TypeError, ValueError):
+            continue
+    log.info(
+        "marketdata chain %s: %d contracts across %d expiries",
+        underlying, n, len(exps),
+    )
 
     defs: List[OptionDefinition] = []
     quotes: List[Quote] = []
@@ -185,7 +187,6 @@ def _fetch_chain(
             bid = _f(data, "bid", i)
             ask = _f(data, "ask", i)
             last = _f(data, "last", i)
-            # Thinly-traded contracts sometimes have no bid/ask — use last.
             if bid <= 0 and ask <= 0 and last > 0:
                 bid = ask = last
 
@@ -212,6 +213,35 @@ def _fetch_chain(
             continue
 
     return defs, quotes, oi_map
+
+
+def _http_get_json(url: str, headers: dict, timeout: float) -> Optional[dict]:
+    try:
+        r = httpx.get(url, headers=headers, timeout=timeout)
+    except httpx.TimeoutException as exc:
+        log.warning("marketdata timeout after %.0fs: %s", timeout, exc)
+        return None
+    except Exception as exc:  # noqa: BLE001
+        log.warning("marketdata request failed: %s", exc)
+        return None
+
+    if r.status_code == 401:
+        log.error(
+            "marketdata 401 — check MARKETDATA_TOKEN (got: %s)", r.text[:200],
+        )
+        return None
+    if r.status_code == 429:
+        log.warning("marketdata 429 — over free-tier quota for today")
+        return None
+    if r.status_code == 402:
+        log.error("marketdata 402 — endpoint requires a paid tier")
+        return None
+    try:
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("marketdata parse failed: %s", exc)
+        return None
 
 
 def _f(data: dict, key: str, i: int) -> float:
