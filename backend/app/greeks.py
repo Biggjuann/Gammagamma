@@ -128,14 +128,24 @@ def implied_vol(
     sigma[invalid] = np.nan
     active = ~invalid
 
+    # Tighter IV floor: real options rarely trade below 3% IV. Clipping at
+    # 0.001 lets the solver "succeed" on stale quotes with an IV near zero,
+    # which then explodes gamma (∝ 1/sigma) and blows up GEX totals.
     for _ in range(max_iter):
         if not active.any():
             break
         g = greeks(S, K, T, r, np.where(active, sigma, 0.2), is_call, q)
         diff = g.price - mp
         step = diff / np.maximum(g.vega, 1e-6)
-        new_sigma = np.clip(sigma - step, 1e-3, 5.0)
+        new_sigma = np.clip(sigma - step, 0.03, 5.0)
         sigma = np.where(active, new_sigma, sigma)
         active = active & (np.abs(diff) > tol)
 
+    # Anything stuck at the clip boundary didn't really solve; mark NaN so
+    # downstream filters skip these rows instead of using runaway greeks.
+    sigma = np.where(
+        (sigma <= 0.031) | (sigma >= 4.99),
+        np.nan,
+        sigma,
+    )
     return sigma

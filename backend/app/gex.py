@@ -216,7 +216,9 @@ def build_chain_snapshot(
     r = settings.risk_free_rate
 
     iv = implied_vol(mid, S, K, T, r, is_call)
-    valid = np.isfinite(iv)
+    # Accept only plausibly-solved IVs. Near-zero IVs make gamma explode
+    # (∝ 1/sigma), which is what produced the quadrillion-dollar GEX totals.
+    valid = np.isfinite(iv) & (iv >= 0.03) & (iv <= 3.0)
     iv[~valid] = np.nan
 
     g = greeks(S, K, T, r, np.where(valid, iv, 0.2), is_call)
