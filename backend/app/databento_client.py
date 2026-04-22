@@ -589,13 +589,28 @@ def _fixture_trades(underlying: str) -> List[TradeTick]:
     return build_fixture_trades(underlying)
 
 
-_CLIENT: Optional[DatabentoClient] = None
+_CLIENT: Optional[object] = None
 
 
-def get_client() -> DatabentoClient:
+def get_client():
+    """Return the active chain client.
+
+    Default source is Yahoo (free, no key). Set ``DATA_SOURCE=databento`` in
+    the environment to route through the Databento client instead.
+    """
     global _CLIENT
     if _CLIENT is None:
-        _CLIENT = DatabentoClient()
+        import os
+
+        source = os.getenv("DATA_SOURCE", "yahoo").lower()
+        if source == "databento":
+            _CLIENT = DatabentoClient()
+            log.info("chain source: Databento (OPRA.PILLAR)")
+        else:
+            from .yahoo_chain import YahooChainClient
+
+            _CLIENT = YahooChainClient()
+            log.info("chain source: Yahoo Finance options (free)")
     return _CLIENT
 
 

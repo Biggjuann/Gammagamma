@@ -58,16 +58,16 @@ Open <http://localhost:3000>.
 
 ## Data source
 
-All data originates from the consolidated OPRA feed (all 18 US options exchanges) via
-[Databento's OPRA.PILLAR](https://databento.com/datasets/OPRA.PILLAR) dataset. The
-backend uses:
+Default: **Yahoo Finance options chain** — free, no API key required, ~15-20 minute
+delayed, includes real open interest. Perfect for overnight / structural GEX analysis.
 
-| schema       | purpose                                        |
-|--------------|------------------------------------------------|
-| `definition` | contract metadata (strike, expiry, type)       |
-| `cmbp-1`     | consolidated NBBO for mid-price / IV solve     |
-| `trades`     | flow (sweep/block detection, aggressor side)   |
-| `statistics` | open interest                                  |
+Optional: **Databento OPRA.PILLAR** (paid) — consolidated OPRA data, batch or live.
+Set `DATA_SOURCE=databento` and provide `DATABENTO_API_KEY` to route through it.
+
+| Source    | Cost       | Delay      | OI         | Coverage                     |
+|-----------|------------|------------|------------|------------------------------|
+| Yahoo     | Free       | 15-20 min  | Real       | SPY, QQQ, IWM, SPX/NDX/RUT   |
+| Databento | $30-2k/mo  | 4h → live  | Real       | All OPRA contracts           |
 
 ## Disclaimer
 
