@@ -226,15 +226,12 @@ def _fetch_single_expiry(
     underlying: str,
 ) -> Tuple[List[OptionDefinition], List[Quote], Dict[int, int]]:
     url = f"{_MD_BASE}/options/chain/{sym}/"
-    # feed=cached uses EOD-cached data which has looser rate limits than
-    # live. Fine for our twice-daily snapshot cadence.
-    params = {"feed": "cached"}
+    params: dict = {}
     if expiration:
         params["expiration"] = expiration
 
     data = _http_get_json(url, headers, timeout=60.0, params=params)
     if data is None:
-        # one retry with longer timeout for large chains
         data = _http_get_json(url, headers, timeout=90.0, params=params)
     if data is None:
         return [], [], {}
@@ -319,20 +316,40 @@ def _http_get_json(
         log.warning("marketdata request failed (%s): %s", url, exc)
         return None
 
+    # Log first 300 chars of body + response headers so we can see WHY the
+    # server is rejecting — free-tier quota, rate limit, plan restriction,
+    # or a plain auth bug.
+    body_preview = r.text[:300].replace("\n", " ") if r.text else "<empty>"
+    rl_limit = r.headers.get("x-ratelimit-limit")
+    rl_remaining = r.headers.get("x-ratelimit-remaining")
+    rl_reset = r.headers.get("x-ratelimit-reset")
+    rl_consumed = r.headers.get("x-ratelimit-consumed")
+
     if r.status_code == 401:
-        log.error("marketdata 401 — check MARKETDATA_TOKEN (got: %s)", r.text[:200])
-        return None
-    if r.status_code == 429:
-        log.warning("marketdata 429 — over free-tier quota for today")
+        log.error(
+            "marketdata 401 (url=%s) — check MARKETDATA_TOKEN. body=%s",
+            url, body_preview,
+        )
         return None
     if r.status_code == 402:
-        log.error("marketdata 402 — endpoint requires a paid tier")
+        log.error(
+            "marketdata 402 — endpoint requires a paid tier. body=%s", body_preview,
+        )
+        return None
+    if r.status_code == 429:
+        log.warning(
+            "marketdata 429 (url=%s) limit=%s remaining=%s consumed=%s reset=%s body=%s",
+            url, rl_limit, rl_remaining, rl_consumed, rl_reset, body_preview,
+        )
         return None
     try:
         r.raise_for_status()
         return r.json()
     except Exception as exc:  # noqa: BLE001
-        log.warning("marketdata parse failed: %s", exc)
+        log.warning(
+            "marketdata parse failed (status=%s): %s. body=%s",
+            r.status_code, exc, body_preview,
+        )
         return None
 
 
