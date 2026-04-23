@@ -24,8 +24,11 @@ TICKER_ALIASES = {
 }
 
 
-# Scheduled snapshot times (local to SCHEDULE_TZ). One at cash open, one after close.
-SCHEDULE_TIMES = [(8, 30), (16, 0)]
+# Scheduled snapshot times (local to SCHEDULE_TZ).
+#   08:30 CT = cash open  — overnight OI + open structure
+#   12:00 CT = midday     — catches any big intraday shift
+#   16:00 CT = after close — structure going into next session
+SCHEDULE_TIMES = [(8, 30), (12, 0), (16, 0)]
 SCHEDULE_TZ = "America/Chicago"
 
 
