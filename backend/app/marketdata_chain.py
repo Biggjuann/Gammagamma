@@ -212,14 +212,22 @@ def _pick_target_expiries(all_exps: List[str]) -> List[str]:
         return []
     parsed.sort(key=lambda x: x[1])
 
+    # For each target DTE, prefer the first listed expiry on-or-after the
+    # target date. Without this, "closest to target" can land on a 178d
+    # expiry when the LEAPS filter demands dte >= 180, and the whole LEAPS
+    # view renders empty.
     selected = []
     seen = set()
     for dte in target_dtes:
         goal = today + timedelta(days=dte)
-        closest = min(parsed, key=lambda x: abs((x[1] - goal).days))
-        if closest[0] not in seen:
-            seen.add(closest[0])
-            selected.append(closest[0])
+        at_or_after = [p for p in parsed if p[1] >= goal]
+        if at_or_after:
+            chosen = at_or_after[0]
+        else:
+            chosen = parsed[-1]  # graceful fallback to last listed
+        if chosen[0] not in seen:
+            seen.add(chosen[0])
+            selected.append(chosen[0])
     return sorted(selected)
 
 
