@@ -338,8 +338,21 @@ def _fetch_single_expiry(
 def _http_get_json(
     url: str, headers: dict, timeout: float, params: Optional[dict] = None
 ) -> Optional[dict]:
+    # Route marketdata.app calls through a static-IP proxy if one is
+    # configured. marketdata.app's Starter plan enforces a single-IP
+    # security block; Railway's rotating egress IPs trip that block on
+    # every redeploy. Setting MARKETDATA_PROXY_URL (e.g. from Fixie /
+    # QuotaGuard / any auth'd HTTP proxy) keeps our outbound IP stable
+    # from marketdata's perspective.
+    proxy_url = os.getenv("MARKETDATA_PROXY_URL", "").strip() or None
     try:
-        r = httpx.get(url, headers=headers, params=params or {}, timeout=timeout)
+        r = httpx.get(
+            url,
+            headers=headers,
+            params=params or {},
+            timeout=timeout,
+            proxy=proxy_url,
+        )
     except httpx.TimeoutException as exc:
         log.warning("marketdata timeout after %.0fs (%s): %s", timeout, url, exc)
         return None
