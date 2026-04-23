@@ -229,9 +229,14 @@ def _fetch_single_expiry(
     # CRITICAL credit-saver: marketdata.app charges per symbol in the
     # response when bid/ask/mid/last columns are present. Without filters
     # a full SPY chain can be ~300 credits per expiry; with these filters
-    # ~30. Docs: https://www.marketdata.app/docs/api/rate-limiting
+    # ~60. Docs: https://www.marketdata.app/docs/api/rate-limiting
+    #
+    # strikeLimit=200 covers ±100 strikes around ATM. Narrower values
+    # (e.g. 100) trap the response inside the ATM gamma peak zone, which
+    # makes call and put walls converge on the same strike. Real dealer
+    # walls typically sit 20-50 strikes OTM on either side.
     params: dict = {
-        "strikeLimit": "100",        # ±100 strikes around ATM (covers walls)
+        "strikeLimit": "200",
         "mode": "cached",            # EOD-cached quotes: cheaper on paid plans
     }
     if expiration:
