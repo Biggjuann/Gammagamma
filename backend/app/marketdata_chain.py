@@ -191,12 +191,16 @@ def _fetch_expirations(sym: str, headers: dict) -> List[str]:
 def _pick_target_expiries(all_exps: List[str]) -> List[str]:
     """Pick ~4 strategically-spaced expiries.
 
-    Targets: 0DTE, +7d, +30d, +90d — covers 0DTE / weekly / monthly /
-    leaps-ish. Fewer targets keeps us inside marketdata's free-tier
-    burst limit.
+    Targets map to dashboard filters:
+      0 DTE  → 0DTE + Weekly (near end)
+      7 DTE  → Weekly
+      30 DTE → Monthly (filter covers 7 < dte ≤ 45)
+      180 DTE → LEAPS (filter requires dte ≥ 180)
+
+    Fewer targets keeps us inside marketdata.app's credit budget.
     """
     today = date.today()
-    target_dtes = [0, 7, 30, 90]
+    target_dtes = [0, 7, 30, 180]
 
     parsed: List[Tuple[str, date]] = []
     for e in all_exps:
