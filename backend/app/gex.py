@@ -180,6 +180,25 @@ def build_chain_snapshot(
             spot = _spot(underlying)
             log.warning("spot fallback to fixture %.2f for %s", spot, underlying)
 
+    # "0DTE" = the nearest listed future expiry, whatever its calendar DTE.
+    # A pure `dte <= 1.0` cutoff breaks on Friday evenings / weekends /
+    # holidays, when today's expiry has already settled and the next listed
+    # one sits at dte ≈ 2–3 (Monday). Locking to the earliest remaining
+    # expiry date keeps the 0DTE tab populated at all times.
+    nearest_exp_date = None
+    if expiry_filter == "0dte":
+        future_exp = [
+            d.expiration for d in defs
+            if d.instrument_id in quotes_by_id
+            and (d.expiration - now).total_seconds() >= 0
+        ]
+        if future_exp:
+            nearest_exp_date = min(future_exp).date()
+            log.info(
+                "0DTE filter for %s: locking to nearest expiry %s",
+                underlying, nearest_exp_date.isoformat(),
+            )
+
     # vectorise
     keep_defs: List = []
     for d in defs:
@@ -188,17 +207,22 @@ def build_chain_snapshot(
         dte = (d.expiration - now).total_seconds() / 86400.0
         if dte < 0:
             continue
-        if expiry_filter == "0dte" and dte > 1.0:
+        if expiry_filter == "0dte":
+            if nearest_exp_date is None or d.expiration.date() != nearest_exp_date:
+                continue
+        elif expiry_filter == "weekly" and not (0 <= dte <= 7):
             continue
-        if expiry_filter == "weekly" and not (0 <= dte <= 7):
+        elif expiry_filter == "monthly" and not (7 < dte <= 45):
             continue
-        if expiry_filter == "monthly" and not (7 < dte <= 45):
-            continue
-        if expiry_filter == "leaps" and dte < 180:
+        elif expiry_filter == "leaps" and dte < 180:
             continue
         keep_defs.append(d)
 
     if not keep_defs:
+        log.warning(
+            "no rows kept for %s after expiry_filter=%s (defs=%d, quotes=%d)",
+            underlying, expiry_filter, len(defs), len(quotes_by_id),
+        )
         return ChainSnapshot(underlying, spot, now, [], 0.0, 0.0, 0.0, 0.0)
 
     K = np.array([d.strike for d in keep_defs])
