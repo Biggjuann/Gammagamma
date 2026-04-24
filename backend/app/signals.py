@@ -50,14 +50,27 @@ def structural_levels(snapshot: ChainSnapshot) -> StructuralLevels:
     call_wall = float(strikes[int(np.argmax(call_gex))]) if call_gex.size else None
     put_wall = float(strikes[int(np.argmin(put_gex))]) if put_gex.size else None
 
-    # Gamma flip: cumulative GEX crossing zero nearest spot
+    # Gamma flip.
+    # Primary: cumulative GEX zero-crossing nearest spot. Works for
+    # balanced chains (Monthly / LEAPS) where calls and puts roughly
+    # offset.
+    # Fallback: the strike where per-strike net GEX itself flips sign
+    # nearest spot. Short-dated chains (0DTE / Weekly) are often lopsided
+    # end-to-end (total GEX one-signed), so cumsum never crosses zero —
+    # but per-strike still transitions from put-dominated (negative) to
+    # call-dominated (positive) somewhere in the middle. That transition
+    # *is* the call/put dominance boundary traders read as "gamma flip".
     cum = np.cumsum(net_gex)
     flip_idx = None
     for i in range(1, len(cum)):
         if cum[i - 1] * cum[i] < 0:
-            # choose the crossing closest to spot
             if flip_idx is None or abs(strikes[i] - spot) < abs(strikes[flip_idx] - spot):
                 flip_idx = i
+    if flip_idx is None:
+        for i in range(1, len(net_gex)):
+            if net_gex[i - 1] * net_gex[i] < 0:
+                if flip_idx is None or abs(strikes[i] - spot) < abs(strikes[flip_idx] - spot):
+                    flip_idx = i
     gamma_flip = float(strikes[flip_idx]) if flip_idx is not None else None
 
     # GVWAP = Σ |gex| * K  /  Σ |gex|
