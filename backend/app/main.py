@@ -149,6 +149,39 @@ def ticker(
         )
 
 
+@app.get("/api/levels/{symbol}")
+def levels(
+    symbol: str,
+    expiry: Optional[str] = Query(None, pattern="^(0dte|weekly|monthly|leaps|all)$"),
+) -> dict:
+    """Lightweight levels-only payload for downstream consumers
+    (MotiveWave studies, other agents). Returns just spot + structural
+    levels, no rows / flow / playbook. ~500 bytes vs the full bundle.
+    """
+    sym = symbol.upper()
+    if sym not in get_settings().universe:
+        raise HTTPException(404, f"{sym} not in universe")
+    flt = None if expiry in (None, "all") else expiry
+    try:
+        b = get_bundle(sym, expiry_filter=flt)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("levels %s build failed: %s", sym, exc)
+        raise HTTPException(502, f"{type(exc).__name__}: {exc}")
+    return {
+        "underlying": b.underlying,
+        "asof": b.asof.isoformat(),
+        "expiry_filter": flt or "all",
+        "spot": b.spot,
+        "call_wall": b.levels.call_wall,
+        "put_wall": b.levels.put_wall,
+        "gamma_flip": b.levels.gamma_flip,
+        "gvwap": b.levels.gvwap,
+        "major_call_walls": b.levels.major_call_walls,
+        "major_put_walls": b.levels.major_put_walls,
+        "total_gex": b.total_gex,
+    }
+
+
 @app.post("/api/cache/reset")
 def cache_reset() -> dict:
     reset_cache()
