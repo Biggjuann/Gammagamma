@@ -11,16 +11,22 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-DEFAULT_UNIVERSE = ["SPX", "SPY", "QQQ", "ES"]
+DEFAULT_UNIVERSE = ["SPX", "SPY", "QQQ", "ES", "NQ"]
 
 
-# ES is a display alias: it reuses SPY's option chain and renders strikes / spot
-# at ES scale (×10). No extra Databento fetch.
+# Display aliases reuse another underlying's option chain and render
+# strikes / spot at the alias's price scale. No extra chain fetch.
+#   ES → SPY × ~10
+#   NQ → QQQ × ~41.5
 TICKER_ALIASES = {
     # ES actually trades at ~SPY × 10.084 (SPX/SPY tracking delta + ES
     # futures basis premium). The live ES=F / SPY ratio is used at query
     # time when available; this fallback is the historical average.
     "ES": {"source": "SPY", "scale": 10.084},
+    # NQ tracks NDX nearly 1:1 (small futures basis), and NDX ≈ QQQ × ~41.5
+    # in the current price regime. Live NQ=F / QQQ ratio overrides at query
+    # time; the fallback is the recent running average.
+    "NQ": {"source": "QQQ", "scale": 41.5},
 }
 
 
