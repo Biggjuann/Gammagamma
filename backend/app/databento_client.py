@@ -598,6 +598,9 @@ def get_client():
     Default source is Yahoo (free, no key). Set ``DATA_SOURCE`` in the
     environment to switch:
 
+      * ``DATA_SOURCE=schwab``     → Schwab Trader API via shared token
+        (requires ``SCHWAB_TOKEN_URL`` + ``SCHWAB_TOKEN_SHARE_KEY``).
+        Real-time bid/ask/OI/Greeks; preferred when available.
       * ``DATA_SOURCE=marketdata`` → marketdata.app (requires
         ``MARKETDATA_TOKEN``).
       * ``DATA_SOURCE=databento``  → Databento OPRA.PILLAR (requires
@@ -610,7 +613,12 @@ def get_client():
         import os
 
         source = os.getenv("DATA_SOURCE", "yahoo").lower()
-        if source == "databento":
+        if source == "schwab":
+            from .schwab_client import SchwabChainClient
+
+            _CLIENT = SchwabChainClient()
+            log.info("chain source: Schwab Trader API (share-token)")
+        elif source == "databento":
             _CLIENT = DatabentoClient()
             log.info("chain source: Databento (OPRA.PILLAR)")
         elif source == "marketdata":
