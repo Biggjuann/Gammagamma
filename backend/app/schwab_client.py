@@ -115,35 +115,103 @@ class _TokenManager:
 
         token: Optional[str] = None
         expires_in = self._DEFAULT_TTL_SECONDS
+        payload = None
         try:
             payload = r.json()
-            if isinstance(payload, dict):
-                token = (
-                    payload.get("access_token")
-                    or payload.get("accessToken")
-                    or payload.get("token")
-                )
-                ei = payload.get("expires_in") or payload.get("expiresIn")
-                if ei:
-                    expires_in = int(ei)
-            elif isinstance(payload, str):
-                token = payload.strip()
         except Exception:  # noqa: BLE001
-            # plain-text body
-            token = r.text.strip() if r.text else None
+            payload = None
+
+        if payload is not None:
+            token = _extract_token(payload)
+            ei = _extract_expires_in(payload)
+            if ei:
+                expires_in = ei
+        if token is None:
+            # plain-text body fallback (must still look like a token)
+            token = _validated_token(r.text.strip()) if r.text else None
 
         if not token:
             log.error(
-                "Schwab share-token response had no token. body=%s",
-                r.text[:200],
+                "Schwab share-token response had no usable token. "
+                "status=%d content-type=%r body_preview=%r",
+                r.status_code,
+                r.headers.get("content-type"),
+                (r.text or "")[:300].replace("\n", " "),
             )
             self._access_token = None
             return None
 
         self._access_token = token
         self._access_expires_at = time.time() + expires_in
-        log.info("Schwab access token fetched from share endpoint (ttl=%ds)", expires_in)
+        log.info(
+            "Schwab access token fetched from share endpoint "
+            "(token_len=%d, ttl=%ds)",
+            len(token), expires_in,
+        )
         return self._access_token
+
+
+# Plausibility check: real Schwab access tokens are 100–4000 char pure-ASCII
+# JWTs with no whitespace. Rejecting anything else avoids passing wrapper HTML
+# or full response bodies as the "token" (which then explodes with a
+# UnicodeEncodeError when httpx tries to ASCII-encode the Authorization header).
+def _validated_token(s: Optional[str]) -> Optional[str]:
+    if not isinstance(s, str):
+        return None
+    s = s.strip()
+    if len(s) < 20 or len(s) > 4000:
+        return None
+    if any(c.isspace() for c in s):
+        return None
+    try:
+        s.encode("ascii")
+    except UnicodeEncodeError:
+        return None
+    return s
+
+
+def _extract_token(payload) -> Optional[str]:
+    """Recursively find a plausible token in JSON of unknown shape.
+
+    Handles common share-endpoint payloads:
+      {"access_token": "..."}
+      {"accessToken": "..."}
+      {"token": "..."}
+      {"data": {"access_token": "..."}}
+      {"result": {"token": "..."}}
+    """
+    if isinstance(payload, str):
+        return _validated_token(payload)
+    if isinstance(payload, dict):
+        for k in ("access_token", "accessToken", "token", "bearer", "bearerToken"):
+            v = payload.get(k)
+            if isinstance(v, str):
+                tok = _validated_token(v)
+                if tok:
+                    return tok
+        for k in ("data", "result", "payload", "response", "schwab"):
+            if k in payload:
+                tok = _extract_token(payload[k])
+                if tok:
+                    return tok
+    return None
+
+
+def _extract_expires_in(payload) -> Optional[int]:
+    if not isinstance(payload, dict):
+        return None
+    for k in ("expires_in", "expiresIn", "ttl", "expiry"):
+        v = payload.get(k)
+        if isinstance(v, (int, float)) and v > 0:
+            return int(v)
+        if isinstance(v, str) and v.isdigit():
+            return int(v)
+    for k in ("data", "result", "payload", "response"):
+        nested = payload.get(k)
+        ei = _extract_expires_in(nested) if isinstance(nested, dict) else None
+        if ei:
+            return ei
+    return None
 
 
 # ---------------------------------------------------------------------
