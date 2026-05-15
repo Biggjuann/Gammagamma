@@ -54,6 +54,23 @@ def _instrument_id(option_symbol: str) -> int:
     return int(h[:15], 16)
 
 
+# Schwab quote endpoint accepts different symbol conventions for spot
+# quotes than the chains endpoint. ETFs are bare, indices use $, and
+# futures use a leading slash (continuous front-month).
+_SCHWAB_QUOTE_SYMBOLS: Dict[str, str] = {
+    "SPX": "$SPX",
+    "NDX": "$NDX",
+    "RUT": "$RUT",
+    "VIX": "$VIX",
+    "ES": "/ES",
+    "NQ": "/NQ",
+}
+
+
+def _schwab_quote_symbol(underlying: str) -> str:
+    return _SCHWAB_QUOTE_SYMBOLS.get(underlying, underlying)
+
+
 # ---------------------------------------------------------------------
 # Token fetch — hits the shared endpoint owned by another service.
 # Response shape supported:
@@ -151,6 +168,82 @@ class _TokenManager:
         return self._access_token
 
 
+# Module-level singleton so other modules (spot.py) can reuse the
+# same access token without re-initializing the OAuth state.
+_TOKEN_MANAGER: Optional[_TokenManager] = None
+
+
+def _get_token_manager() -> _TokenManager:
+    global _TOKEN_MANAGER
+    if _TOKEN_MANAGER is None:
+        _TOKEN_MANAGER = _TokenManager()
+    return _TOKEN_MANAGER
+
+
+def fetch_schwab_spot(underlying: str) -> Optional[float]:
+    """Real-time spot from Schwab's /marketdata/v1/quotes endpoint.
+
+    Returns None if not configured or the call fails — caller should
+    fall back to Stooq/Yahoo.
+    """
+    tokens = _get_token_manager()
+    if not tokens.has_credentials():
+        return None
+    tok = tokens.get_access_token()
+    if not tok:
+        return None
+    sym = _schwab_quote_symbol(underlying)
+    try:
+        r = httpx.get(
+            f"{_SCHWAB_BASE}/marketdata/v1/quotes",
+            params={"symbols": sym},
+            headers={
+                "Authorization": f"Bearer {tok}",
+                "Accept": "application/json",
+            },
+            timeout=10.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Schwab quote %s failed: %s", sym, exc)
+        return None
+    if r.status_code != 200:
+        log.warning(
+            "Schwab quote %s non-200 (%d): %s",
+            sym, r.status_code, r.text[:200],
+        )
+        return None
+    try:
+        data = r.json()
+    except Exception:  # noqa: BLE001
+        return None
+
+    # Response shape:
+    #   {"SPY": {"quote": {"lastPrice": 742.09, "mark": ..., "closePrice": ...}}, ...}
+    # Index/futures responses sometimes nest differently — walk defensively.
+    entry = data.get(sym) or data.get(underlying)
+    if not isinstance(entry, dict):
+        for v in data.values():
+            if isinstance(v, dict) and ("quote" in v or "lastPrice" in v):
+                entry = v
+                break
+    if not isinstance(entry, dict):
+        return None
+    quote = entry.get("quote") if isinstance(entry.get("quote"), dict) else entry
+    for k in (
+        "lastPrice", "last", "mark", "regularMarketLastPrice",
+        "closePrice", "askPrice", "bidPrice",
+    ):
+        v = quote.get(k)
+        if v is not None:
+            try:
+                fv = float(v)
+                if fv > 0:
+                    return fv
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
 # Plausibility check: real Schwab access tokens are 100–4000 char pure-ASCII
 # JWTs with no whitespace. Rejecting anything else avoids passing wrapper HTML
 # or full response bodies as the "token" (which then explodes with a
@@ -220,7 +313,7 @@ def _extract_expires_in(payload) -> Optional[int]:
 class SchwabChainClient:
     def __init__(self) -> None:
         self.dataset = "SCHWAB"
-        self._tokens = _TokenManager()
+        self._tokens = _get_token_manager()
         if self._tokens.has_credentials():
             log.info("Schwab chain client active (share-token mode)")
 

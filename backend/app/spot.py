@@ -1,19 +1,28 @@
-"""Live underlying spot — direct HTTP to free quote APIs, no SDK.
+"""Live underlying spot — Schwab first (when configured), then free fallbacks.
 
-yfinance has been consistently broken against Yahoo's current endpoints
-from data centers (returns 'Expecting value' JSON-parse errors / 403s).
-We bypass it and call two free public APIs directly:
+When DATA_SOURCE=schwab and credentials are present, we hit Schwab's
+/marketdata/v1/quotes endpoint for true real-time. That removes the
+two failure modes that hurt accuracy with the free vendors:
 
-1. **Stooq** (primary) — CSV, no key, generally works from data centers.
-2. **Yahoo v8 chart** (backup) — JSON, no key, sometimes blocked by IP.
+1. Stooq's nq.f returns NQ continuous front but is sometimes off by
+   100+ points from the actual front-month NQ futures.
+2. Spot×scale drift: chain spot and alias scale are fetched from
+   separate Stooq calls at slightly different freshness, so the
+   displayed alias spot doesn't equal either input cleanly.
 
-If both fail, callers fall through to put-call parity on the chain.
+Schwab gives us one authoritative source for all five tickers.
+
+Fallback order if Schwab fails or isn't configured:
+1. **Stooq** — CSV, no key, generally works from data centers.
+2. **Yahoo v8 chart** — JSON, no key, sometimes IP-blocked.
+3. Caller falls through to put-call parity on the chain.
 """
 from __future__ import annotations
 
 import csv
 import io
 import logging
+import os
 from datetime import timedelta
 from typing import Optional
 
@@ -62,6 +71,19 @@ def get_live_spot(underlying: str) -> Optional[float]:
 
 
 def _fetch(underlying: str) -> Optional[float]:
+    # Schwab first (real-time) when active. Avoids the off-by-100pt
+    # drift we see on Stooq's nq.f and the spot×scale staleness issue.
+    if os.getenv("DATA_SOURCE", "").lower() == "schwab":
+        try:
+            from .schwab_client import fetch_schwab_spot
+
+            px = fetch_schwab_spot(underlying)
+            if px is not None:
+                log.info("live spot %s = %.2f (schwab)", underlying, px)
+                return px
+        except Exception as exc:  # noqa: BLE001
+            log.warning("schwab spot %s failed, falling back: %s", underlying, exc)
+
     stooq_sym, yahoo_sym = _SYMBOL_MAP[underlying]
 
     if stooq_sym:
