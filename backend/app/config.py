@@ -31,10 +31,32 @@ TICKER_ALIASES = {
 
 
 # Scheduled snapshot times (local to SCHEDULE_TZ).
-#   08:30 CT = cash open  — overnight OI + open structure
-#   12:00 CT = midday     — catches any big intraday shift
-#   16:00 CT = after close — structure going into next session
-SCHEDULE_TIMES = [(8, 30), (12, 0), (16, 0)]
+# US cash session = 08:30–15:00 CT (= 09:30–16:00 ET).
+# Schwab has no daily-credit budget, so we can refresh aggressively
+# without cost pressure. This schedule captures opening drive, every
+# hour of the cash session, the close ramp, and a post-close tick:
+#   08:30 CT = cash open
+#   09:30 CT
+#   10:30 CT
+#   11:30 CT
+#   12:30 CT = midday / lunch
+#   13:30 CT
+#   14:30 CT = power hour
+#   14:50 CT = last 10 min, where closing imbalance prints
+#   15:00 CT = cash close
+#   15:30 CT = 30 min post-close (structure into next session)
+SCHEDULE_TIMES = [
+    (8, 30),
+    (9, 30),
+    (10, 30),
+    (11, 30),
+    (12, 30),
+    (13, 30),
+    (14, 30),
+    (14, 50),
+    (15, 0),
+    (15, 30),
+]
 SCHEDULE_TZ = "America/Chicago"
 
 
