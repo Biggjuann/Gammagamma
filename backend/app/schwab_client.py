@@ -20,7 +20,7 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import httpx
@@ -271,46 +271,108 @@ class SchwabChainClient:
 
 # ---------------------------------------------------------------------
 # Fetch + parse
+#
+# Strategy: Schwab's gateway (Apigee) returns 502 "Body buffer overflow"
+# when the chains response exceeds ~5 MB. SPX with strikeCount=200 and
+# all expirations is ~20 MB. We split into 4 narrow date windows that
+# map to the dashboard's expiry tabs (0DTE / Weekly / Monthly / LEAPS).
+# Each window stays well under the cap and the four together give the
+# coverage the structural-levels code needs.
 # ---------------------------------------------------------------------
+_EXPIRY_WINDOWS = [
+    ("0dte",    0,   1),    # today + 1d slack for Fri close / weekends
+    ("weekly",  5,   12),   # next weekly Friday
+    ("monthly", 25,  40),   # nearest monthly
+    ("leaps",   150, 220),  # ~6m structural
+]
+
+
 def _fetch_chain(
     underlying: str, access_token: str
 ) -> Tuple[List[OptionDefinition], List[Quote], Dict[int, int]]:
     sym = _schwab_symbol(underlying)
-    url = f"{_SCHWAB_BASE}/marketdata/v1/chains"
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
     }
-    # strikeCount = strikes above and below ATM. 200 ≈ ±200 strikes covers
-    # OTM walls for SPY/QQQ; index chains can be wider but Schwab caps.
+    today = date.today()
+
+    all_defs: List[OptionDefinition] = []
+    all_quotes: List[Quote] = []
+    all_oi: Dict[int, int] = {}
+
+    for label, lo_days, hi_days in _EXPIRY_WINDOWS:
+        from_date = today + timedelta(days=lo_days)
+        to_date = today + timedelta(days=hi_days)
+        defs, quotes, oi = _fetch_window(
+            sym, underlying, headers, from_date, to_date, label
+        )
+        all_defs.extend(defs)
+        all_quotes.extend(quotes)
+        all_oi.update(oi)
+        time.sleep(0.3)  # gentle pacing between Schwab calls
+
+    exps_seen = len({d.expiration.date().isoformat() for d in all_defs})
+    log.info(
+        "Schwab %s merged: %d contracts across %d expiries",
+        underlying, len(all_defs), exps_seen,
+    )
+    return all_defs, all_quotes, all_oi
+
+
+def _fetch_window(
+    sym: str,
+    underlying: str,
+    headers: dict,
+    from_date: date,
+    to_date: date,
+    label: str,
+) -> Tuple[List[OptionDefinition], List[Quote], Dict[int, int]]:
+    url = f"{_SCHWAB_BASE}/marketdata/v1/chains"
     params = {
         "symbol": sym,
-        "strikeCount": "200",
+        # strikeCount = strikes above AND below ATM. 60 → 120 strikes total.
+        # Covers ±$300 on SPY (typical OTM wall zone) and ±$1500 on SPX.
+        # Smaller than the 200 that overflowed the gateway.
+        "strikeCount": "60",
         "contractType": "ALL",
+        "fromDate": from_date.isoformat(),
+        "toDate": to_date.isoformat(),
     }
     try:
         r = httpx.get(url, headers=headers, params=params, timeout=30.0)
     except Exception as exc:  # noqa: BLE001
-        log.warning("Schwab chains %s failed: %s", sym, exc)
+        log.warning(
+            "Schwab chains %s [%s %s..%s] failed: %s",
+            sym, label, from_date, to_date, exc,
+        )
         return [], [], {}
     if r.status_code != 200:
         log.warning(
-            "Schwab chains %s non-200 (%d): %s",
-            sym, r.status_code, r.text[:300],
+            "Schwab chains %s [%s %s..%s] non-200 (%d): %s",
+            sym, label, from_date, to_date, r.status_code, r.text[:200],
         )
         return [], [], {}
     try:
         data = r.json()
     except Exception as exc:  # noqa: BLE001
-        log.warning("Schwab chains %s bad JSON: %s", sym, exc)
+        log.warning(
+            "Schwab chains %s [%s] bad JSON: %s", sym, label, exc,
+        )
         return [], [], {}
     if (data.get("status") or "").upper() != "SUCCESS":
         log.warning(
-            "Schwab chains %s status=%s body=%s",
-            sym, data.get("status"), r.text[:200],
+            "Schwab chains %s [%s] status=%s body=%s",
+            sym, label, data.get("status"), r.text[:200],
         )
         return [], [], {}
 
+    return _parse_chain_payload(data, underlying)
+
+
+def _parse_chain_payload(
+    data: dict, underlying: str
+) -> Tuple[List[OptionDefinition], List[Quote], Dict[int, int]]:
     defs: List[OptionDefinition] = []
     quotes: List[Quote] = []
     oi_map: Dict[int, int] = {}
@@ -366,11 +428,6 @@ def _fetch_chain(
                     )
                     oi_map[iid] = int(row.get("openInterest", 0) or 0)
 
-    exps_seen = len({d.expiration.date().isoformat() for d in defs})
-    log.info(
-        "Schwab %s: %d contracts across %d expiries",
-        underlying, len(defs), exps_seen,
-    )
     return defs, quotes, oi_map
 
 
