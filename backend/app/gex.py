@@ -32,6 +32,14 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class ChainRow:
+    # Per-contract greeks are raw BSM values in native units:
+    #   delta  — dimensionless (dPrice/dSpot)
+    #   gamma  — per unit spot        (d²Price/dSpot²)
+    #   vanna  — per unit σ           (dDelta/dSigma; σ is fractional, 0.20 = 20%)
+    #   charm  — per year             (dDelta/dT; T is fractional years)
+    # Aggregate totals in ChainSnapshot re-normalise these into trader units
+    # (per 1% spot, per 1 vol point, per calendar day). See gex.py near the
+    # `*_dollar` block for the exact conventions.
     instrument_id: int
     strike: float
     expiry: datetime
@@ -255,12 +263,22 @@ def build_chain_snapshot(
 
     # Dealer convention: public buys calls (dealer short calls → dealer short gamma on calls)
     # and buys puts (dealer short puts → dealer also short gamma on puts).
-    # Aggregate per contract: GEX_$ = gamma * OI * multiplier * spot^2 * 0.01
-    #   sign: calls contribute +, puts contribute - (Gamma Sonar convention).
+    #
+    # Aggregation & unit conventions (raw greeks come in BSM-native units:
+    # gamma is per-unit-spot, vanna is per-unit-σ, charm is per-year, delta
+    # is dimensionless). Each aggregate normalises to a trader-readable unit:
+    #
+    #   DEX_$   = delta * OI * mult * spot                → notional $ delta exposure
+    #   GEX_$   = ±gamma * OI * mult * spot² * 0.01       → $ delta change per 1% spot
+    #             (sign: calls +, puts − — Gamma Sonar convention)
+    #   VANNA_$ = vanna * OI * mult * spot * 0.01         → $ delta change per 1 vol point
+    #             (× 0.01 converts BSM's per-unit-σ into per-percentage-point)
+    #   CHARM_$ = charm * OI * mult * spot / 365          → $ delta change per calendar day
+    #             (/ 365 converts BSM's per-year into per-day)
     sign = np.where(is_call, 1.0, -1.0)
     gex_dollar = sign * g.gamma * oi * mult * (spot ** 2) * 0.01
     dex_dollar = g.delta * oi * mult * spot
-    vanna_dollar = g.vanna * oi * mult * spot
+    vanna_dollar = g.vanna * oi * mult * spot * 0.01
     charm_dollar = g.charm * oi * mult * spot / 365.0
 
     rows: List[ChainRow] = []
