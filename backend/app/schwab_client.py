@@ -366,18 +366,18 @@ class SchwabChainClient:
 # Fetch + parse
 #
 # Strategy: Schwab's gateway (Apigee) returns 502 "Body buffer overflow"
-# when the chains response exceeds ~5 MB. SPX with strikeCount=200 and
-# all expirations is ~20 MB. We split into 4 narrow date windows that
-# map to the dashboard's expiry tabs (0DTE / Weekly / Monthly / LEAPS).
-# Each window stays well under the cap and the four together give the
-# coverage the structural-levels code needs.
+# when the chains response exceeds ~5 MB. Wide date windows on tickers
+# with daily expirations (SPY, QQQ, SPX) blow past that cap — SPY at
+# strikeCount=60 across a 70-day LEAPS window packs ~15 daily expiries
+# × ~120 strikes × ~600 bytes each = ~10 MB.
+#
+# The robust fix: hit /expirationchain first to see the actual listed
+# expirations, pick 4 target dates (0DTE / Weekly / Monthly / LEAPS),
+# and call /chains once per exact date with fromDate=toDate=that date.
+# Each call is guaranteed to hold at most one expiration (~120 strikes,
+# ~72 KB) — no cap risk, and coverage is precise instead of guessed.
 # ---------------------------------------------------------------------
-_EXPIRY_WINDOWS = [
-    ("0dte",    0,   1),    # today + 1d slack for Fri close / weekends
-    ("weekly",  5,   12),   # next weekly Friday
-    ("monthly", 25,  40),   # nearest monthly
-    ("leaps",   150, 220),  # ~6m structural
-]
+_TARGET_DTES = [0, 7, 30, 180]
 
 
 def _fetch_chain(
@@ -388,17 +388,27 @@ def _fetch_chain(
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
     }
-    today = date.today()
+
+    target_dates = _pick_target_expirations(sym, headers)
+    if not target_dates:
+        log.warning(
+            "Schwab %s: expirationchain returned nothing, cannot fetch chain",
+            sym,
+        )
+        return [], [], {}
+
+    log.info(
+        "Schwab %s: fetching %d target expirations: %s",
+        underlying, len(target_dates), [d.isoformat() for d in target_dates],
+    )
 
     all_defs: List[OptionDefinition] = []
     all_quotes: List[Quote] = []
     all_oi: Dict[int, int] = {}
 
-    for label, lo_days, hi_days in _EXPIRY_WINDOWS:
-        from_date = today + timedelta(days=lo_days)
-        to_date = today + timedelta(days=hi_days)
-        defs, quotes, oi = _fetch_window(
-            sym, underlying, headers, from_date, to_date, label
+    for exp_date in target_dates:
+        defs, quotes, oi = _fetch_single_expiration(
+            sym, underlying, headers, exp_date
         )
         all_defs.extend(defs)
         all_quotes.extend(quotes)
@@ -413,50 +423,102 @@ def _fetch_chain(
     return all_defs, all_quotes, all_oi
 
 
-def _fetch_window(
+def _pick_target_expirations(sym: str, headers: dict) -> List[date]:
+    """Query /expirationchain and pick 4 target dates near 0/7/30/180 DTE.
+
+    Uses "first listed on-or-after target" so the LEAPS bucket doesn't
+    accidentally land on a 178d expiry (which would then be filtered out
+    of the LEAPS tab by dte>=180 check in gex.py).
+    """
+    url = f"{_SCHWAB_BASE}/marketdata/v1/expirationchain"
+    try:
+        r = httpx.get(
+            url,
+            headers=headers,
+            params={"symbol": sym},
+            timeout=15.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Schwab expirationchain %s failed: %s", sym, exc)
+        return []
+    if r.status_code != 200:
+        log.warning(
+            "Schwab expirationchain %s non-200 (%d): %s",
+            sym, r.status_code, r.text[:200],
+        )
+        return []
+    try:
+        data = r.json()
+    except Exception:  # noqa: BLE001
+        return []
+
+    parsed: List[date] = []
+    for row in data.get("expirationList") or []:
+        s = row.get("expirationDate")
+        if not s:
+            continue
+        try:
+            parsed.append(date.fromisoformat(s[:10]))
+        except (ValueError, TypeError):
+            continue
+    if not parsed:
+        return []
+    parsed.sort()
+
+    today = date.today()
+    chosen: List[date] = []
+    seen = set()
+    for dte in _TARGET_DTES:
+        goal = today + timedelta(days=dte)
+        at_or_after = [d for d in parsed if d >= goal]
+        pick = at_or_after[0] if at_or_after else parsed[-1]
+        if pick not in seen:
+            seen.add(pick)
+            chosen.append(pick)
+    return sorted(chosen)
+
+
+def _fetch_single_expiration(
     sym: str,
     underlying: str,
     headers: dict,
-    from_date: date,
-    to_date: date,
-    label: str,
+    exp_date: date,
 ) -> Tuple[List[OptionDefinition], List[Quote], Dict[int, int]]:
     url = f"{_SCHWAB_BASE}/marketdata/v1/chains"
     params = {
         "symbol": sym,
         # strikeCount = strikes above AND below ATM. 60 → 120 strikes total.
         # Covers ±$300 on SPY (typical OTM wall zone) and ±$1500 on SPX.
-        # Smaller than the 200 that overflowed the gateway.
+        # With fromDate=toDate=one expiry, response is ~72 KB — no cap risk.
         "strikeCount": "60",
         "contractType": "ALL",
-        "fromDate": from_date.isoformat(),
-        "toDate": to_date.isoformat(),
+        "fromDate": exp_date.isoformat(),
+        "toDate": exp_date.isoformat(),
     }
     try:
         r = httpx.get(url, headers=headers, params=params, timeout=30.0)
     except Exception as exc:  # noqa: BLE001
         log.warning(
-            "Schwab chains %s [%s %s..%s] failed: %s",
-            sym, label, from_date, to_date, exc,
+            "Schwab chains %s [%s] failed: %s", sym, exp_date, exc,
         )
         return [], [], {}
     if r.status_code != 200:
         log.warning(
-            "Schwab chains %s [%s %s..%s] non-200 (%d): %s",
-            sym, label, from_date, to_date, r.status_code, r.text[:200],
+            "Schwab chains %s [%s] non-200 (%d): %s",
+            sym, exp_date, r.status_code, r.text[:200],
         )
         return [], [], {}
     try:
         data = r.json()
     except Exception as exc:  # noqa: BLE001
         log.warning(
-            "Schwab chains %s [%s] bad JSON: %s", sym, label, exc,
+            "Schwab chains %s [%s] bad JSON: %s", sym, exp_date, exc,
         )
         return [], [], {}
     if (data.get("status") or "").upper() != "SUCCESS":
         log.warning(
             "Schwab chains %s [%s] status=%s body=%s",
-            sym, label, data.get("status"), r.text[:200],
+            sym, exp_date, data.get("status"), r.text[:200],
         )
         return [], [], {}
 
