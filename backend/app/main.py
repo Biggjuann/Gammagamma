@@ -182,6 +182,42 @@ def levels(
     }
 
 
+@app.get("/api/range/{symbol}")
+def range_single(symbol: str) -> dict:
+    """Daily expected-range analysis for one ticker.
+
+    Combines IV width (1-SD move from ATM IV × √T), skew shape
+    (25-delta strikes), and GEX regime (spot vs gamma_flip) into a
+    single view of where the day is likely to range and where it will
+    turn. Anchors on the 0DTE / nearest expiry.
+    """
+    sym = symbol.upper()
+    if sym not in get_settings().universe:
+        raise HTTPException(404, f"{sym} not in universe")
+    from .range import build_daily_range_from_bundle
+    try:
+        b = get_bundle(sym, expiry_filter="0dte")
+    except Exception as exc:  # noqa: BLE001
+        log.exception("range %s build failed: %s", sym, exc)
+        raise HTTPException(502, f"{type(exc).__name__}: {exc}")
+    return build_daily_range_from_bundle(b).to_json()
+
+
+@app.get("/api/range")
+def range_all() -> dict:
+    """Daily range summaries for every ticker in the universe."""
+    from .range import build_daily_range_from_bundle
+    out = []
+    for sym in get_settings().universe:
+        try:
+            b = get_bundle(sym, expiry_filter="0dte")
+            out.append(build_daily_range_from_bundle(b).to_json())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("range for %s failed: %s", sym, exc)
+            out.append({"underlying": sym, "error": str(exc)})
+    return {"rows": out}
+
+
 @app.post("/api/cache/reset")
 def cache_reset() -> dict:
     reset_cache()
