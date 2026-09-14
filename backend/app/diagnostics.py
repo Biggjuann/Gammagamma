@@ -66,6 +66,135 @@ def _schwab_token_probe() -> Dict[str, object]:
     return {"configured": True, "ok": True, "token_length": len(tok)}
 
 
+_SCHWAB_STATUS_HINTS = {
+    400: "bad request — usually a symbol Schwab doesn't recognise for this "
+         "endpoint (indices need the $ prefix, e.g. $SPX)",
+    401: "token rejected — the share endpoint handed us a token Schwab will "
+         "not accept. Either it is expired, or it was minted for a different "
+         "Schwab app than the one calling.",
+    403: "forbidden — the token is valid but the Schwab app behind it is not "
+         "entitled to Market Data. Market Data is a separate API product from "
+         "Accounts & Trading and must be approved on the app.",
+    404: "not found — endpoint path or symbol is wrong",
+    429: "rate limited by Schwab",
+}
+
+
+def _schwab_api_probe(symbol: str) -> Dict[str, object]:
+    """Call Schwab's market-data endpoints and report the raw HTTP result.
+
+    Credentials being *present* says nothing about whether Schwab accepts
+    them. This separates the three failure modes that all surface as an
+    empty chain: token rejected (401), app not entitled to market data
+    (403), and symbol not recognised (400 / empty expirationList).
+
+    Only Schwab's own status codes and a short body preview are reported —
+    never the token or the share key.
+    """
+    import httpx
+
+    from .schwab_client import (
+        _SCHWAB_BASE,
+        _get_token_manager,
+        _schwab_symbol,
+    )
+
+    out: Dict[str, object] = {"symbol": symbol}
+    tok = _get_token_manager().get_access_token()
+    if not tok:
+        out["error"] = "no access token — see schwab_token above"
+        return out
+
+    sym = _schwab_symbol(symbol)
+    out["schwab_symbol"] = sym
+    headers = {"Authorization": f"Bearer {tok}", "Accept": "application/json"}
+
+    def _call(name: str, path: str, params: dict) -> Optional[dict]:
+        entry: Dict[str, object] = {"endpoint": path, "params": params}
+        try:
+            r = httpx.get(
+                f"{_SCHWAB_BASE}{path}", headers=headers, params=params, timeout=20.0
+            )
+        except Exception as exc:  # noqa: BLE001
+            entry["error"] = f"{type(exc).__name__}: {exc}"
+            out[name] = entry
+            return None
+        entry["status"] = r.status_code
+        if r.status_code in _SCHWAB_STATUS_HINTS:
+            entry["hint"] = _SCHWAB_STATUS_HINTS[r.status_code]
+        if r.status_code != 200:
+            entry["body_preview"] = (r.text or "")[:300].replace("\n", " ")
+            out[name] = entry
+            return None
+        try:
+            data = r.json()
+        except Exception as exc:  # noqa: BLE001
+            entry["error"] = f"non-JSON body: {exc}"
+            out[name] = entry
+            return None
+        out[name] = entry
+        return data
+
+    exp = _call(
+        "expirationchain",
+        "/marketdata/v1/expirationchain",
+        {"symbol": sym},
+    )
+    if exp is None:
+        return out
+
+    listed = exp.get("expirationList") or []
+    probe = out["expirationchain"]
+    assert isinstance(probe, dict)
+    probe["expirations_returned"] = len(listed)
+    probe["first_few"] = [
+        row.get("expirationDate") for row in listed[:5] if isinstance(row, dict)
+    ]
+    if not listed:
+        probe["hint"] = (
+            "200 OK but no expirations — Schwab does not list options under "
+            f"{sym!r}. Check the symbol mapping."
+        )
+        return out
+
+    # One real chain call against the nearest listed expiry.
+    nearest = None
+    for row in listed:
+        if isinstance(row, dict) and row.get("expirationDate"):
+            nearest = str(row["expirationDate"])[:10]
+            break
+    if not nearest:
+        return out
+
+    chain = _call(
+        "chains",
+        "/marketdata/v1/chains",
+        {
+            "symbol": sym,
+            "strikeCount": "5",
+            "contractType": "ALL",
+            "fromDate": nearest,
+            "toDate": nearest,
+        },
+    )
+    if chain is None:
+        return out
+
+    entry = out["chains"]
+    assert isinstance(entry, dict)
+    entry["schwab_status"] = chain.get("status")
+    calls = chain.get("callExpDateMap") or {}
+    puts = chain.get("putExpDateMap") or {}
+    entry["call_expiries"] = len(calls)
+    entry["put_expiries"] = len(puts)
+    if not calls and not puts:
+        entry["hint"] = (
+            "200 OK but both expiry maps are empty — Schwab returned no "
+            "contracts for this date window."
+        )
+    return out
+
+
 def _probe_symbol(symbol: str) -> Dict[str, object]:
     """Count what the active client actually returns for one symbol.
 
@@ -145,6 +274,13 @@ def build_report(*, symbols: Optional[List[str]] = None) -> dict:
 
     report["chains"] = [_probe_symbol(src) for src in sources]
 
+    # When Schwab is active and something is empty, go one level deeper and
+    # ask Schwab directly — the HTTP status is what separates "token
+    # expired" from "app not entitled" from "wrong symbol".
+    if source == "schwab" and report.get("schwab_token", {}).get("ok"):
+        if any(c.get("verdict") != "OK" for c in report["chains"]):
+            report["schwab_api"] = [_schwab_api_probe(src) for src in sources]
+
     # Databento without a key silently serves the offline fixture chain —
     # it looks healthy but the numbers are synthetic, so call it out.
     report["fixtures_active"] = (
@@ -173,6 +309,28 @@ def build_report(*, symbols: Optional[List[str]] = None) -> dict:
         report["summary"] = (
             "Schwab token unavailable: "
             f"{report['schwab_token'].get('detail')}"
+        )
+    elif report.get("schwab_api"):
+        # Lead with whatever Schwab itself said — that is the root cause.
+        parts = []
+        for probe in report["schwab_api"]:
+            for name in ("expirationchain", "chains"):
+                call = probe.get(name)
+                if not isinstance(call, dict):
+                    continue
+                if call.get("error"):
+                    parts.append(f"{probe['symbol']} {name}: {call['error']}")
+                elif call.get("hint"):
+                    parts.append(
+                        f"{probe['symbol']} {name} HTTP "
+                        f"{call.get('status')}: {call['hint']}"
+                    )
+        report["summary"] = (
+            "; ".join(dict.fromkeys(parts))
+            if parts
+            else "; ".join(
+                f"{c['symbol']}: {c.get('verdict') or c.get('error')}" for c in bad
+            )
         )
     else:
         report["summary"] = "; ".join(
