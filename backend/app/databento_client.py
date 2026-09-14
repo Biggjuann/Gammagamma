@@ -591,6 +591,8 @@ def _fixture_trades(underlying: str) -> List[TradeTick]:
 
 _CLIENT: Optional[object] = None
 
+_KNOWN_SOURCES = frozenset({"schwab", "marketdata", "databento", "yahoo"})
+
 
 def get_client():
     """Return the active chain client.
@@ -612,7 +614,19 @@ def get_client():
     if _CLIENT is None:
         import os
 
-        source = os.getenv("DATA_SOURCE", "yahoo").lower()
+        raw = os.getenv("DATA_SOURCE", "yahoo")
+        source = raw.strip().lower()
+        # A stray space or newline in the env var used to land here as an
+        # unrecognised value and fall silently through to Yahoo — which is
+        # rate-limited from data-center IPs, so the chain came back empty
+        # while the logs still claimed the configured source was fine.
+        if source and source not in _KNOWN_SOURCES:
+            log.error(
+                "DATA_SOURCE=%r is not a recognised source (expected one of "
+                "%s) — falling back to Yahoo, which is usually IP-blocked "
+                "from data centers. Fix the variable.",
+                raw, ", ".join(sorted(_KNOWN_SOURCES)),
+            )
         if source == "schwab":
             from .schwab_client import SchwabChainClient
 

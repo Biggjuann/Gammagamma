@@ -247,9 +247,44 @@ def build_report(*, symbols: Optional[List[str]] = None) -> dict:
     settings = get_settings()
     source = settings.data_source
 
+    # The *resolved* client, not the configured string. These disagree when
+    # DATA_SOURCE has stray whitespace or a typo: get_client() falls through
+    # to Yahoo while every log line still says what you meant to configure.
+    active: Dict[str, object] = {}
+    try:
+        from .databento_client import _KNOWN_SOURCES, get_client
+
+        client = get_client()
+        active = {
+            "client_class": type(client).__name__,
+            "dataset": getattr(client, "dataset", None),
+            "data_source_raw": repr(os.getenv("DATA_SOURCE")),
+            "recognised": source in _KNOWN_SOURCES,
+        }
+        expected = {
+            "schwab": "SchwabChainClient",
+            "marketdata": "MarketdataChainClient",
+            "databento": "DatabentoClient",
+            "yahoo": "YahooChainClient",
+        }.get(source)
+        if expected and expected != active["client_class"]:
+            active["mismatch"] = (
+                f"DATA_SOURCE={source!r} should use {expected} but "
+                f"{active['client_class']} is active"
+            )
+        elif not active["recognised"]:
+            active["mismatch"] = (
+                f"DATA_SOURCE={os.getenv('DATA_SOURCE')!r} is not a recognised "
+                f"source — {active['client_class']} is active instead. Yahoo is "
+                "rate-limited from data-center IPs, so the chain will be empty."
+            )
+    except Exception as exc:  # noqa: BLE001
+        active = {"error": f"{type(exc).__name__}: {exc}"}
+
     report: dict = {
         "asof": datetime.now(timezone.utc).isoformat(),
         "data_source": source,
+        "active_client": active,
         "credentials": _source_credentials(source),
         "universe": settings.universe,
         "ttl_seconds": {
@@ -292,7 +327,9 @@ def build_report(*, symbols: Optional[List[str]] = None) -> dict:
 
     # Observed chain state outranks credential inference: if contracts are
     # coming through, the pipeline is working whatever the env looks like.
-    if not bad:
+    if active.get("mismatch"):
+        report["summary"] = str(active["mismatch"])
+    elif not bad:
         report["summary"] = (
             "All chains returning data"
             + (" (synthetic fixtures — DATABENTO_API_KEY is not set)"

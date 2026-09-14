@@ -73,7 +73,7 @@ def get_live_spot(underlying: str) -> Optional[float]:
 def _fetch(underlying: str) -> Optional[float]:
     # Schwab first (real-time) when active. Avoids the off-by-100pt
     # drift we see on Stooq's nq.f and the spot×scale staleness issue.
-    if os.getenv("DATA_SOURCE", "").lower() == "schwab":
+    if os.getenv("DATA_SOURCE", "").strip().lower() == "schwab":
         try:
             from .schwab_client import fetch_schwab_spot
 
