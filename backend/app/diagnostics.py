@@ -53,17 +53,94 @@ def _schwab_token_probe() -> Dict[str, object]:
         tok = tokens.get_access_token()
     except Exception as exc:  # noqa: BLE001
         return {"configured": True, "ok": False, "detail": f"{type(exc).__name__}: {exc}"}
+    attempts = list(getattr(tokens, "last_attempts", []) or [])
+    keys = getattr(tokens, "last_payload_keys", None)
     if not tok:
+        got_200 = any(a.get("status") == 200 for a in attempts)
+        if not attempts:
+            detail = (
+                "no request was made to the share endpoint — the token was "
+                "cached as unavailable"
+            )
+        elif not got_200:
+            detail = (
+                "the share endpoint rejected every auth scheme this service "
+                "tries (Bearer, X-API-Key, ?key=). Either SCHWAB_TOKEN_URL / "
+                "SCHWAB_TOKEN_SHARE_KEY are wrong, or the endpoint expects a "
+                "scheme not listed here."
+            )
+        else:
+            detail = (
+                "the share endpoint answered 200 but no access token could be "
+                f"read out of the body. Top-level keys returned: {keys}. If "
+                "the token lives under one of those, this service does not "
+                "recognise that key name."
+            )
         return {
             "configured": True,
             "ok": False,
-            "detail": (
-                "share endpoint returned no usable token — check that the "
-                "owning service's Schwab refresh token is still valid "
-                "(they expire every 7 days)"
-            ),
+            "attempts": attempts,
+            "payload_keys": keys,
+            "detail": detail,
         }
-    return {"configured": True, "ok": True, "token_length": len(tok)}
+    return {
+        "configured": True,
+        "ok": True,
+        "token_length": len(tok),
+        "attempts": attempts,
+        "token_key": getattr(tokens, "last_token_source", None),
+        "payload_keys": keys,
+    }
+
+
+def _schwab_quotes_probe(symbol: str) -> Dict[str, object]:
+    """Probe the quotes endpoint — the path that resolves spot.
+
+    Spot and chain use the same token but different Schwab endpoints, and
+    entitlements can differ between them, so probe it separately.
+    """
+    import httpx
+
+    from .schwab_client import (
+        _SCHWAB_BASE,
+        _get_token_manager,
+        _schwab_quote_symbol,
+    )
+
+    sym = _schwab_quote_symbol(symbol)
+    out: Dict[str, object] = {"symbol": symbol, "schwab_symbol": sym}
+    tok = _get_token_manager().get_access_token()
+    if not tok:
+        out["error"] = "no access token — see schwab_token above"
+        return out
+    try:
+        r = httpx.get(
+            f"{_SCHWAB_BASE}/marketdata/v1/quotes",
+            params={"symbols": sym},
+            headers={"Authorization": f"Bearer {tok}", "Accept": "application/json"},
+            timeout=20.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = f"{type(exc).__name__}: {exc}"
+        return out
+    out["status"] = r.status_code
+    if r.status_code in _SCHWAB_STATUS_HINTS:
+        out["hint"] = _SCHWAB_STATUS_HINTS[r.status_code]
+    if r.status_code != 200:
+        from .schwab_client import _redact
+
+        out["body_preview"] = _redact(r.text or "")
+        return out
+    try:
+        out["symbols_returned"] = sorted((r.json() or {}).keys())
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = f"non-JSON body: {exc}"
+        return out
+    from .spot import get_live_spot  # noqa: F401  (kept for parity)
+    from .schwab_client import fetch_schwab_spot
+
+    out["resolved_price"] = fetch_schwab_spot(symbol)
+    return out
 
 
 _SCHWAB_STATUS_HINTS = {
@@ -315,6 +392,7 @@ def build_report(*, symbols: Optional[List[str]] = None) -> dict:
     if source == "schwab" and report.get("schwab_token", {}).get("ok"):
         if any(c.get("verdict") != "OK" for c in report["chains"]):
             report["schwab_api"] = [_schwab_api_probe(src) for src in sources]
+            report["schwab_quotes"] = [_schwab_quotes_probe(src) for src in sources]
 
     # Databento without a key silently serves the offline fixture chain —
     # it looks healthy but the numbers are synthetic, so call it out.

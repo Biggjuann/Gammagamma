@@ -83,12 +83,27 @@ def _schwab_quote_symbol(underlying: str) -> str:
 class _TokenManager:
     _DEFAULT_TTL_SECONDS = 25 * 60
 
+    # A share endpoint is someone else's contract, and not every one of them
+    # authenticates with a Bearer header. Try the common schemes in order and
+    # keep the first that answers 200 — otherwise a perfectly valid shared
+    # token is unreachable purely because of how the key is presented.
+    _AUTH_SCHEMES = (
+        ("bearer", lambda key: ({"Authorization": f"Bearer {key}"}, {})),
+        ("x-api-key", lambda key: ({"X-API-Key": key}, {})),
+        ("query-key", lambda key: ({}, {"key": key})),
+    )
+
     def __init__(self) -> None:
         self._url = os.getenv("SCHWAB_TOKEN_URL", "").strip()
         self._share_key = os.getenv("SCHWAB_TOKEN_SHARE_KEY", "").strip()
         self._access_token: Optional[str] = None
         self._access_expires_at: float = 0.0
         self._lock = threading.Lock()
+        # Populated on every fetch attempt so /api/diagnostics can explain a
+        # failure without anyone tailing container logs.
+        self.last_attempts: List[dict] = []
+        self.last_token_source: Optional[str] = None
+        self.last_payload_keys: Optional[List[str]] = None
         if not self.has_credentials():
             log.warning(
                 "Schwab share-token config incomplete — set "
@@ -108,24 +123,52 @@ class _TokenManager:
             return self._fetch_token_locked()
 
     def _fetch_token_locked(self) -> Optional[str]:
-        try:
-            r = httpx.get(
-                self._url,
-                headers={
-                    "Authorization": f"Bearer {self._share_key}",
-                    "Accept": "application/json",
-                },
-                timeout=10.0,
+        self.last_attempts = []
+        self.last_token_source = None
+        self.last_payload_keys = None
+
+        r = None
+        for name, build in self._AUTH_SCHEMES:
+            headers, params = build(self._share_key)
+            headers = {**headers, "Accept": "application/json"}
+            try:
+                resp = httpx.get(
+                    self._url, headers=headers, params=params, timeout=10.0
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.last_attempts.append(
+                    {"scheme": name, "error": f"{type(exc).__name__}: {exc}"}
+                )
+                log.error("Schwab share-token fetch (%s) failed: %s", name, exc)
+                continue
+            self.last_attempts.append(
+                {"scheme": name, "status": resp.status_code}
             )
-        except Exception as exc:  # noqa: BLE001
-            log.error("Schwab share-token fetch failed: %s", exc)
-            return None
-        if r.status_code != 200:
+            if resp.status_code == 200:
+                if name != "bearer":
+                    log.warning(
+                        "Schwab share-token endpoint accepted the %s scheme, "
+                        "not Bearer — the endpoint's auth differs from what "
+                        "this service sends by default.",
+                        name,
+                    )
+                r = resp
+                break
             log.error(
-                "Schwab share-token endpoint returned %d: %s — check "
-                "SCHWAB_TOKEN_URL / SCHWAB_TOKEN_SHARE_KEY, and verify the "
-                "owner service's refresh token hasn't expired.",
-                r.status_code, r.text[:200],
+                "Schwab share-token endpoint returned %d for the %s scheme: "
+                "%s",
+                resp.status_code, name, resp.text[:200],
+            )
+
+        if r is None:
+            log.error(
+                "Schwab share-token endpoint rejected every auth scheme "
+                "(%s) — check SCHWAB_TOKEN_URL / SCHWAB_TOKEN_SHARE_KEY, and "
+                "verify the owner service's refresh token hasn't expired.",
+                ", ".join(
+                    f"{a['scheme']}={a.get('status') or a.get('error')}"
+                    for a in self.last_attempts
+                ),
             )
             self._access_token = None
             return None
@@ -139,7 +182,10 @@ class _TokenManager:
             payload = None
 
         if payload is not None:
-            token = _extract_token(payload)
+            if isinstance(payload, dict):
+                self.last_payload_keys = sorted(str(k) for k in payload)
+            token, source = _extract_token_with_source(payload)
+            self.last_token_source = source
             ei = _extract_expires_in(payload)
             if ei:
                 expires_in = ei
@@ -150,10 +196,11 @@ class _TokenManager:
         if not token:
             log.error(
                 "Schwab share-token response had no usable token. "
-                "status=%d content-type=%r body_preview=%r",
+                "status=%d content-type=%r top_level_keys=%s body_preview=%r",
                 r.status_code,
                 r.headers.get("content-type"),
-                (r.text or "")[:300].replace("\n", " "),
+                self.last_payload_keys,
+                _redact(r.text or ""),
             )
             self._access_token = None
             return None
@@ -162,8 +209,8 @@ class _TokenManager:
         self._access_expires_at = time.time() + expires_in
         log.info(
             "Schwab access token fetched from share endpoint "
-            "(token_len=%d, ttl=%ds)",
-            len(token), expires_in,
+            "(token_len=%d, ttl=%ds, key=%s)",
+            len(token), expires_in, self.last_token_source,
         )
         return self._access_token
 
@@ -244,6 +291,24 @@ def fetch_schwab_spot(underlying: str) -> Optional[float]:
     return None
 
 
+def _redact(text: str, limit: int = 300) -> str:
+    """Preview a response body with anything token-shaped removed.
+
+    Diagnostics are read over HTTP by whoever can reach the API, so a raw
+    body preview must never carry the credential it was fetched to get.
+    Any unbroken run of 20+ non-space characters is replaced by its length.
+    """
+    import re
+
+    cleaned = re.sub(
+        r"[^\s\"',}\]]{20,}",
+        lambda m: f"<redacted:{len(m.group(0))}>",
+        text or "",
+    )
+    cleaned = " ".join(cleaned.split())
+    return cleaned[:limit]
+
+
 # Plausibility check: real Schwab access tokens are 100–4000 char pure-ASCII
 # JWTs with no whitespace. Rejecting anything else avoids passing wrapper HTML
 # or full response bodies as the "token" (which then explodes with a
@@ -263,31 +328,89 @@ def _validated_token(s: Optional[str]) -> Optional[str]:
     return s
 
 
-def _extract_token(payload) -> Optional[str]:
-    """Recursively find a plausible token in JSON of unknown shape.
+# A refresh token must never be sent as a Bearer — Schwab rejects it, and
+# it is the long-lived credential. Any key that looks like one is skipped.
+def _is_refresh_key(key: str) -> bool:
+    return "refresh" in key.lower()
 
-    Handles common share-endpoint payloads:
-      {"access_token": "..."}
-      {"accessToken": "..."}
-      {"token": "..."}
-      {"data": {"access_token": "..."}}
-      {"result": {"token": "..."}}
+
+def _extract_token_with_source(payload, path: str = "") -> tuple:
+    """Find a plausible access token in JSON of unknown shape.
+
+    Returns ``(token, key_path)`` so callers can report *where* the token
+    came from. Three passes, most specific first:
+
+      1. the well-known key names, at this level
+      2. the well-known wrapper objects, recursively
+      3. a generic walk over every key whose name suggests an access token
+
+    Pass 3 exists because a share endpoint is someone else's contract: a
+    payload like ``{"schwabAccessToken": "..."}`` used to fall through
+    every explicit name, hit the raw-text fallback, get rejected for
+    containing whitespace (it is JSON, after all), and surface as "no
+    usable token" — indistinguishable from an expired credential.
     """
     if isinstance(payload, str):
-        return _validated_token(payload)
-    if isinstance(payload, dict):
-        for k in ("access_token", "accessToken", "token", "bearer", "bearerToken"):
-            v = payload.get(k)
-            if isinstance(v, str):
-                tok = _validated_token(v)
-                if tok:
-                    return tok
-        for k in ("data", "result", "payload", "response", "schwab"):
-            if k in payload:
-                tok = _extract_token(payload[k])
-                if tok:
-                    return tok
-    return None
+        return _validated_token(payload), path or "<body>"
+    if not isinstance(payload, dict):
+        return None, None
+
+    for k in ("access_token", "accessToken", "token", "bearer", "bearerToken"):
+        v = payload.get(k)
+        if isinstance(v, str) and not _is_refresh_key(k):
+            tok = _validated_token(v)
+            if tok:
+                return tok, f"{path}.{k}" if path else k
+
+    for k in ("data", "result", "payload", "response", "schwab"):
+        if k in payload:
+            tok, src = _extract_token_with_source(
+                payload[k], f"{path}.{k}" if path else k
+            )
+            if tok:
+                return tok, src
+
+    # Generic pass: any key that reads like an access token. "access" wins
+    # over a bare "token" so {"access": ..., "id_token": ...} picks right.
+    def _score(key: str) -> int:
+        kl = key.lower()
+        if "access" in kl and ("token" in kl or "tok" in kl):
+            return 3
+        if "token" in kl or "jwt" in kl or "bearer" in kl:
+            return 2
+        if "access" in kl:
+            return 1
+        return 0
+
+    candidates = []
+    for k, v in payload.items():
+        if not isinstance(k, str) or _is_refresh_key(k):
+            continue
+        score = _score(k)
+        if score and isinstance(v, str):
+            tok = _validated_token(v)
+            if tok:
+                candidates.append((score, k, tok))
+    if candidates:
+        candidates.sort(key=lambda c: -c[0])
+        _, k, tok = candidates[0]
+        return tok, f"{path}.{k}" if path else k
+
+    # Last resort: recurse into any nested object we have not tried yet.
+    for k, v in payload.items():
+        if isinstance(v, dict) and k not in (
+            "data", "result", "payload", "response", "schwab"
+        ):
+            tok, src = _extract_token_with_source(v, f"{path}.{k}" if path else k)
+            if tok:
+                return tok, src
+    return None, None
+
+
+def _extract_token(payload) -> Optional[str]:
+    """Backwards-compatible wrapper — see :func:`_extract_token_with_source`."""
+    tok, _ = _extract_token_with_source(payload)
+    return tok
 
 
 def _extract_expires_in(payload) -> Optional[int]:
