@@ -325,13 +325,25 @@ class SchwabChainClient:
         def _load():
             tok = self._tokens.get_access_token()
             if not tok:
+                # Loud, because every downstream symptom of this is silent:
+                # the chain comes back empty and the dashboard just shows
+                # zeros. cached_call() no longer caches this empty tuple,
+                # so the next request retries the token fetch.
+                log.error(
+                    "Schwab chain %s skipped — no access token. %s",
+                    underlying,
+                    "SCHWAB_TOKEN_URL / SCHWAB_TOKEN_SHARE_KEY are not set"
+                    if not self._tokens.has_credentials()
+                    else "the share endpoint did not return a usable token "
+                         "(its refresh token may have expired)",
+                )
                 return [], [], {}
             return _fetch_chain(underlying, tok)
 
         return cached_call(
             namespace="schwab_chain",
             key=underlying,
-            ttl=timedelta(seconds=max(settings.refresh_interval_seconds - 5, 60)),
+            ttl=timedelta(seconds=max(settings.chain_ttl_seconds, 60)),
             loader=_load,
         )
 

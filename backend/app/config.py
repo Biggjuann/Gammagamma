@@ -67,6 +67,19 @@ class Settings:
     # fallback TTL if the scheduler isn't running; ~12h lets one snapshot last
     # until the next scheduled refresh.
     refresh_interval_seconds: int = int(os.getenv("REFRESH_INTERVAL_SECONDS", "43200"))
+    # TTL for raw vendor chain payloads. Deliberately separate from
+    # refresh_interval_seconds: that one is a 12h *bundle* fallback, and
+    # reusing it for the chain cache meant the chain was fetched once at
+    # boot and replayed for the rest of the day, so the 10x/day schedule
+    # produced identical snapshots. One hour matches the schedule gap; the
+    # scheduled refresh invalidates these caches explicitly anyway, so this
+    # only bounds on-demand requests between ticks.
+    chain_ttl_seconds: int = int(os.getenv("CHAIN_TTL_SECONDS", "3600"))
+    # How long an *empty* bundle stays cached. Short, so a vendor outage or
+    # an expired token doesn't freeze the dashboard at zero until the next
+    # scheduled tick.
+    empty_bundle_ttl_seconds: int = int(os.getenv("EMPTY_BUNDLE_TTL_SECONDS", "120"))
+    data_source: str = os.getenv("DATA_SOURCE", "yahoo").lower()
     # cmbp-1 tick-stream window for each snapshot call. 5 s is enough for a
     # point-in-time NBBO without pulling a full minute of tape (~10× saving).
     cmbp_window_seconds: int = int(os.getenv("CMBP_WINDOW_SECONDS", "5"))

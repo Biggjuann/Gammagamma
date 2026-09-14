@@ -82,7 +82,10 @@ async def lifespan(app: FastAPI):
 
 async def _scheduled_refresh() -> None:
     log.info("Scheduled refresh starting")
-    reset_cache()
+    # deep=True also drops the raw chain payloads. A shallow reset only
+    # rebuilt bundles from the still-cached chain, so every scheduled tick
+    # reproduced the snapshot taken at boot.
+    reset_cache(deep=True)
     await asyncio.to_thread(prime_universe)
     # push to any live WS subscribers
     for sym in get_settings().universe:
@@ -218,10 +221,38 @@ def range_all() -> dict:
     return {"rows": out}
 
 
+@app.get("/api/diagnostics")
+def diagnostics(
+    symbol: Optional[str] = Query(
+        None, description="Probe one symbol instead of the whole universe."
+    ),
+) -> dict:
+    """Why is the dashboard empty? Answers it without container log access.
+
+    Reports the active data source, whether its credentials are present
+    and working, and what the chain client is actually returning per
+    symbol (contract / quote / OI counts). No secrets are included.
+    """
+    from .diagnostics import build_report
+
+    syms = [symbol.upper()] if symbol else None
+    try:
+        return build_report(symbols=syms)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("diagnostics failed: %s", exc)
+        raise HTTPException(500, f"{type(exc).__name__}: {exc}")
+
+
 @app.post("/api/cache/reset")
-def cache_reset() -> dict:
-    reset_cache()
-    return {"ok": True}
+def cache_reset(
+    deep: bool = Query(
+        True,
+        description="Also drop cached vendor chain payloads so the next "
+                    "build re-fetches. Set false to only rebuild bundles.",
+    ),
+) -> dict:
+    reset_cache(deep=deep)
+    return {"ok": True, "deep": deep}
 
 
 @app.post("/api/refresh")

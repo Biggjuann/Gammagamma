@@ -97,7 +97,7 @@ class YahooChainClient:
         return cached_call(
             namespace="yahoo_chain",
             key=key,
-            ttl=timedelta(seconds=max(settings.refresh_interval_seconds - 5, 60)),
+            ttl=timedelta(seconds=max(settings.chain_ttl_seconds, 60)),
             loader=_load,
         )
 

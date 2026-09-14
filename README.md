@@ -69,6 +69,31 @@ Set `DATA_SOURCE=databento` and provide `DATABENTO_API_KEY` to route through it.
 | Yahoo     | Free       | 15-20 min  | Real       | SPY, QQQ, IWM, SPX/NDX/RUT   |
 | Databento | $30-2k/mo  | 4h → live  | Real       | All OPRA contracts           |
 
+## Troubleshooting: no options data
+
+`GET /api/diagnostics` reports exactly where the chain pipeline is losing
+data — the active source, whether its credentials are present and working,
+and the contract / quote / OI counts the client is actually returning. Add
+`?symbol=SPY` to probe one ticker. No secrets are included in the response.
+
+```bash
+curl -s $API/api/diagnostics | jq .summary
+```
+
+| `summary` says | Cause | Fix |
+|---|---|---|
+| `... not set — the chain fetch cannot run` | The active source's env vars are missing | Set them and redeploy |
+| `Schwab token unavailable: ...` | Share endpoint down, or its refresh token expired (Schwab refresh tokens last 7 days) | Re-authorize the owning service |
+| `NO CHAIN` | Source reachable but returned zero contracts | Check symbology (indices need `$SPX` on Schwab, `^SPX` on Yahoo) |
+| `NO QUOTES` / `NO PRICES` | Contracts listed with no bid/ask | Off-hours on a quote-only source; wait for RTH |
+| `NO OPEN INTEREST` | OI stream failed | GEX falls back to placeholder OI=1; shape is right, absolute $ is a lower bound |
+
+Yahoo is rate-limited from most data-center IPs (HTTP 429), so it is not a
+viable production source — use Schwab or Databento for a deployed instance.
+
+`POST /api/cache/reset` drops the cached chain payloads and forces the next
+request to re-fetch from the vendor (`?deep=false` rebuilds bundles only).
+
 ## Disclaimer
 
 Gammagamma provides structural market analytics for educational purposes. Nothing on

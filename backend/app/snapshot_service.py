@@ -183,16 +183,28 @@ def _build(underlying: str, expiry_filter: Optional[str]) -> Bundle:
 def get_bundle(underlying: str, *, expiry_filter: Optional[str] = None) -> Bundle:
     key = f"{underlying}|{expiry_filter or 'all'}"
     settings = get_settings()
-    ttl = settings.refresh_interval_seconds
     with _LOCK:
         existing = _BUNDLES.get(key)
         if existing and _BUNDLE_EXPIRY.get(key, 0) > time.time():
             return existing
     # build outside the lock so parallel tickers don't block each other
     bundle = _build(underlying, expiry_filter)
+    # A bundle with no rows means the chain fetch came back empty (expired
+    # token, vendor outage, rate limit). Cache it only briefly so the next
+    # request retries instead of pinning the dashboard at zero for hours.
+    if bundle.rows:
+        ttl = max(settings.refresh_interval_seconds - 5, 10)
+    else:
+        ttl = max(settings.empty_bundle_ttl_seconds, 10)
+        log.warning(
+            "%s bundle has no rows — chain fetch returned nothing "
+            "(source=%s). Caching for %ds only so the next request retries. "
+            "See /api/diagnostics.",
+            underlying, settings.data_source, ttl,
+        )
     with _LOCK:
         _BUNDLES[key] = bundle
-        _BUNDLE_EXPIRY[key] = time.time() + max(ttl - 5, 10)
+        _BUNDLE_EXPIRY[key] = time.time() + ttl
     return bundle
 
 
@@ -228,10 +240,21 @@ def prime_universe() -> None:
             log.warning("prime failed for %s: %s", sym, exc)
 
 
-def reset_cache() -> None:
+def reset_cache(*, deep: bool = False) -> None:
+    """Clear the bundle cache. With ``deep``, clear the chain caches too.
+
+    A shallow reset only forces the bundles to be rebuilt — from whatever
+    raw chain payload is still cached, which on the default TTL could be
+    hours old. Scheduled refreshes want ``deep=True`` so the vendor is
+    actually re-queried.
+    """
     with _LOCK:
         _BUNDLES.clear()
         _BUNDLE_EXPIRY.clear()
+    if deep:
+        from .cache import invalidate_chain_caches
+
+        invalidate_chain_caches()
 
 
 __all__ = [

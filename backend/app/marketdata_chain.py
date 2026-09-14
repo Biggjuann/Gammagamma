@@ -84,7 +84,7 @@ class MarketdataChainClient:
         return cached_call(
             namespace="md_chain",
             key=underlying,
-            ttl=timedelta(seconds=max(settings.refresh_interval_seconds - 5, 60)),
+            ttl=timedelta(seconds=max(settings.chain_ttl_seconds, 60)),
             loader=_load,
         )
 
