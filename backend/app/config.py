@@ -30,32 +30,17 @@ TICKER_ALIASES = {
 }
 
 
-# Scheduled snapshot times (local to SCHEDULE_TZ).
+# Scheduled snapshot cadence (local to SCHEDULE_TZ).
 # US cash session = 08:30–15:00 CT (= 09:30–16:00 ET).
-# Schwab has no daily-credit budget, so we can refresh aggressively
-# without cost pressure. This schedule captures opening drive, every
-# hour of the cash session, the close ramp, and a post-close tick:
-#   08:30 CT = cash open
-#   09:30 CT
-#   10:30 CT
-#   11:30 CT
-#   12:30 CT = midday / lunch
-#   13:30 CT
-#   14:30 CT = power hour
-#   14:50 CT = last 10 min, where closing imbalance prints
-#   15:00 CT = cash close
-#   15:30 CT = 30 min post-close (structure into next session)
-SCHEDULE_TIMES = [
-    (8, 30),
-    (9, 30),
-    (10, 30),
-    (11, 30),
-    (12, 30),
-    (13, 30),
-    (14, 30),
-    (14, 50),
-    (15, 0),
-    (15, 30),
+# Schwab has no daily-credit budget, so we refresh every 5 minutes from the
+# cash open through 30 min post-close (structure into next session):
+#   08:30, 08:35, … 14:55, 15:00, … 15:30 CT, Mon–Fri.
+# Each entry is a set of CronTrigger fields; together they cover the window.
+SCHEDULE_INTERVAL_MINUTES = 5
+SCHEDULE_CRONS = [
+    {"hour": "8", "minute": f"30-55/{SCHEDULE_INTERVAL_MINUTES}"},
+    {"hour": "9-14", "minute": f"*/{SCHEDULE_INTERVAL_MINUTES}"},
+    {"hour": "15", "minute": f"0-30/{SCHEDULE_INTERVAL_MINUTES}"},
 ]
 SCHEDULE_TZ = "America/Chicago"
 
@@ -64,9 +49,9 @@ SCHEDULE_TZ = "America/Chicago"
 class Settings:
     databento_api_key: str = os.getenv("DATABENTO_API_KEY", "")
     risk_free_rate: float = float(os.getenv("RISK_FREE_RATE", "0.0525"))
-    # fallback TTL if the scheduler isn't running; ~12h lets one snapshot last
-    # until the next scheduled refresh.
-    refresh_interval_seconds: int = int(os.getenv("REFRESH_INTERVAL_SECONDS", "43200"))
+    # bundle / chain TTL; matches the 5-minute scheduled cadence so on-demand
+    # requests outside the schedule are never more than ~5 min stale.
+    refresh_interval_seconds: int = int(os.getenv("REFRESH_INTERVAL_SECONDS", "300"))
     # cmbp-1 tick-stream window for each snapshot call. 5 s is enough for a
     # point-in-time NBBO without pulling a full minute of tape (~10× saving).
     cmbp_window_seconds: int = int(os.getenv("CMBP_WINDOW_SECONDS", "5"))

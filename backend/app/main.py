@@ -19,7 +19,8 @@ print(f"gammagamma: importing main (PORT={os.getenv('PORT')})", flush=True)
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from .config import SCHEDULE_TIMES, SCHEDULE_TZ, get_settings
+from .cache import cache
+from .config import SCHEDULE_CRONS, SCHEDULE_INTERVAL_MINUTES, SCHEDULE_TZ, get_settings
 from .snapshot_service import (
     get_bundle,
     prime_universe,
@@ -56,17 +57,20 @@ async def lifespan(app: FastAPI):
     scheduler = None
     if settings.schedule_enabled and AsyncIOScheduler is not None:
         scheduler = AsyncIOScheduler(timezone=SCHEDULE_TZ)
-        for hour, minute in SCHEDULE_TIMES:
+        for i, fields in enumerate(SCHEDULE_CRONS):
             scheduler.add_job(
                 _scheduled_refresh,
-                CronTrigger(hour=hour, minute=minute, day_of_week="mon-fri"),
-                id=f"snapshot-{hour:02d}{minute:02d}",
+                CronTrigger(day_of_week="mon-fri", **fields),
+                id=f"snapshot-{i}",
                 replace_existing=True,
+                # a slow tick must not stack up behind itself
+                max_instances=1,
+                coalesce=True,
             )
         scheduler.start()
         log.info(
-            "Scheduled snapshots at %s (%s)",
-            ", ".join(f"{h:02d}:{m:02d}" for h, m in SCHEDULE_TIMES),
+            "Scheduled snapshots every %d min, 08:30–15:30 %s Mon–Fri",
+            SCHEDULE_INTERVAL_MINUTES,
             SCHEDULE_TZ,
         )
         # prime once on boot so the dashboard has data immediately
@@ -80,8 +84,15 @@ async def lifespan(app: FastAPI):
             scheduler.shutdown(wait=False)
 
 
+_CHAIN_NAMESPACES = ("schwab_chain", "yahoo_chain", "md_chain")
+
+
 async def _scheduled_refresh() -> None:
     log.info("Scheduled refresh starting")
+    # Drop the raw chain caches too, otherwise the rebuilt bundles reuse the
+    # previous tick's IVs / quotes until the chain TTL happens to lapse.
+    for ns in _CHAIN_NAMESPACES:
+        cache().invalidate_namespace(ns)
     reset_cache()
     await asyncio.to_thread(prime_universe)
     # push to any live WS subscribers

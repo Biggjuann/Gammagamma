@@ -94,6 +94,28 @@ class TTLCache:
                 except OSError:
                     pass
 
+    def invalidate_namespace(self, namespace: str) -> None:
+        """Drop every live entry in ``namespace`` (memory + disk).
+
+        Stale-fallback copies live in their own namespace and are kept.
+        """
+        prefix = f"{namespace}_"
+
+        def _match(k: str) -> bool:
+            # exact namespace only: "<ns>_<32 hex>", not "<ns>__stale_…"
+            rest = k[len(prefix):]
+            return k.startswith(prefix) and len(rest) == 32 and "_" not in rest
+
+        with self._lock:
+            for k in [k for k in self._mem if _match(k)]:
+                del self._mem[k]
+            for p in CACHE_DIR.glob(f"{prefix}*.pkl"):
+                if _match(p.stem):
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+
 
 _CACHE = TTLCache()
 
@@ -136,6 +158,10 @@ def _is_empty(value: Any) -> bool:
     return False
 
 
+def _stale_ns(namespace: str) -> str:
+    return f"{namespace}__stale"
+
+
 def cached_call(
     namespace: str,
     key: str,
@@ -168,7 +194,7 @@ def cached_call(
             value = loader()
         except Exception as exc:
             if allow_stale_on_error:
-                stale = _CACHE.get(namespace, f"stale::{key}")
+                stale = _CACHE.get(_stale_ns(namespace), key)
                 if stale is not None and not _is_empty(stale):
                     log.warning(
                         "loader %s:%s failed (%s); serving stale value",
@@ -185,5 +211,5 @@ def cached_call(
             return value
 
         _CACHE.set(namespace, key, value, ttl)
-        _CACHE.set(namespace, f"stale::{key}", value, timedelta(days=7))
+        _CACHE.set(_stale_ns(namespace), key, value, timedelta(days=7))
         return value
