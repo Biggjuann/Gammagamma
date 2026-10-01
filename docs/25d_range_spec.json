@@ -1,0 +1,126 @@
+{
+  "name": "Gammagamma 25-delta (25Δ) daily range",
+  "version": "1.0",
+  "purpose": "Derive the market-priced daily range for an underlying from the strikes of the 25-delta call and 25-delta put on the nearest expiry. Mirrors backend/app/range.py, backend/app/gex.py and backend/app/greeks.py.",
+  "source_files": [
+    "backend/app/range.py (build_daily_range_from_bundle, _nearest_delta)",
+    "backend/app/gex.py (build_chain_snapshot: expiry filter, IV solve, delta)",
+    "backend/app/greeks.py (Black-Scholes greeks, implied_vol)"
+  ],
+  "definition": {
+    "upper_bound": "call_25d_strike = strike of the call whose delta is closest to +0.25",
+    "lower_bound": "put_25d_strike = strike of the put whose delta is closest to -0.25",
+    "range": "[put_25d_strike, call_25d_strike]",
+    "interpretation": "Roughly a 25% risk-neutral chance of finishing beyond each bound by expiry. Index skew is put-heavy, so the put bound usually sits farther from spot than the call bound."
+  },
+  "inputs": {
+    "spot": "Underlying price S. Precedence: live quote -> put-call parity from the chain -> fixture fallback.",
+    "option_chain": "Per contract: strike K, expiration (UTC datetime), type 'C' or 'P', mid = (bid + ask) / 2, open interest, multiplier.",
+    "risk_free_rate": "r, continuous. Default 0.0525 (env RISK_FREE_RATE).",
+    "dividend_yield": "q = 0 (not used)."
+  },
+  "steps": [
+    {
+      "step": 1,
+      "name": "Pick the anchor expiry (0DTE)",
+      "detail": "Among contracts that have a quote and an expiration >= now, take the earliest expiration date. Keep only contracts on that date. This is the 'nearest listed expiry', so on weekends/holidays it rolls to the next session (DTE can be 2-3 days)."
+    },
+    {
+      "step": 2,
+      "name": "Time to expiry for greeks",
+      "formula": "T = max((expiration - now).seconds / (365 * 86400), 1/365)",
+      "detail": "Calendar-time years, floored at 1 day for the IV/delta calculation. (Note: range.py separately computes dte_years floored at 1 hour, used only for the 1-SD move, not for delta.)"
+    },
+    {
+      "step": 3,
+      "name": "Solve implied volatility per contract",
+      "method": "Vectorised Newton-Raphson on Black-Scholes price vs mid. Start sigma = 0.30, step = (BS_price - mid) / vega, sigma clipped to [0.03, 5.0], max 60 iterations, tol 1e-4, bisection fallback.",
+      "invalid_inputs": "mid <= 0, NaN mid, T <= 0, S <= 0 or K <= 0 -> IV = NaN.",
+      "acceptance_filter": "Keep the contract only if IV is finite and 0.03 <= IV <= 3.0. Rejected contracts are dropped entirely."
+    },
+    {
+      "step": 4,
+      "name": "Compute Black-Scholes delta",
+      "formulas": {
+        "d1": "(ln(S/K) + (r - q + 0.5 * sigma^2) * T) / (sigma * sqrt(T))",
+        "call_delta": "exp(-q*T) * N(d1)",
+        "put_delta": "call_delta - exp(-q*T)   (i.e. N(d1) - 1 when q = 0)"
+      },
+      "detail": "sigma is the contract's own solved IV (sticky-strike, so skew is reflected). N() is the standard normal CDF."
+    },
+    {
+      "step": 5,
+      "name": "Drop zero-OI contracts",
+      "detail": "If open interest data is available, discard contracts with OI <= 0. If OI data failed to load entirely, keep all IV-valid contracts."
+    },
+    {
+      "step": 6,
+      "name": "Select the 25-delta strikes",
+      "call": "From calls with numeric delta > 0, choose argmin |delta - 0.25|.",
+      "put": "From puts with numeric delta < 0, choose argmin |delta - (-0.25)|.",
+      "notes": [
+        "Nearest-listed-strike selection: no interpolation between strikes, so the bound snaps to a real strike.",
+        "Ties go to whichever row comes first in the chain order (Python min()).",
+        "If no candidates exist on a side, that bound is null."
+      ]
+    },
+    {
+      "step": 7,
+      "name": "Derived skew tilt (optional)",
+      "formula": "skew_tilt = ((spot - put_25d_strike) - (call_25d_strike - spot)) / spot",
+      "interpretation": "> 0: put side wider (bearish/downside tail priced). < 0: call side wider. |skew_tilt| < 0.001 (0.10% of spot) treated as symmetric."
+    }
+  ],
+  "outputs": {
+    "call_25d_strike": "float | null",
+    "put_25d_strike": "float | null",
+    "call_25d_iv": "float | null (the selected call's IV, fractional)",
+    "put_25d_iv": "float | null (the selected put's IV, fractional)",
+    "skew_tilt": "float | null"
+  },
+  "related_context_same_endpoint": {
+    "atm_iv": "Average IV of the call and put at the strike closest to spot (anchor expiry), ignoring missing/non-positive IVs.",
+    "expected_move_1sd": "spot * atm_iv * sqrt(dte_years), with dte_years = max(seconds_to_expiry, 3600) / (365*86400)",
+    "atm_straddle": "ATM call mid + ATM put mid",
+    "regime": "positive_gamma if spot >= gamma_flip else negative_gamma; unknown if gamma_flip missing",
+    "walls_inside_check": "In positive gamma, if put_wall > put_25d_strike and call_wall < call_25d_strike, the GEX walls (not the 25Δ strikes) are treated as the likely turning points. In negative gamma, the 25Δ put strike is treated as the realistic floor before acceleration."
+  },
+  "pseudocode": [
+    "rows = chain where quote exists and expiration >= now",
+    "anchor_date = min(r.expiration.date for r in rows); rows = [r for r in rows if r.expiration.date == anchor_date]",
+    "for r in rows:",
+    "    T = max((r.expiration - now).total_seconds() / (365*86400), 1/365)",
+    "    r.iv = solve_bs_iv(r.mid, S, r.strike, T, rate, r.type)",
+    "    if not (isfinite(r.iv) and 0.03 <= r.iv <= 3.0): drop r",
+    "    if oi_available and r.oi <= 0: drop r",
+    "    d1 = (ln(S/r.strike) + (rate + 0.5*r.iv**2)*T) / (r.iv*sqrt(T))",
+    "    r.delta = N(d1) if r.type == 'C' else N(d1) - 1",
+    "call_25 = argmin(|r.delta - 0.25|  for calls with delta > 0)",
+    "put_25  = argmin(|r.delta + 0.25|  for puts with delta < 0)",
+    "range = (put_25.strike, call_25.strike)",
+    "skew_tilt = ((S - put_25.strike) - (call_25.strike - S)) / S"
+  ],
+  "worked_example": {
+    "note": "Illustrative numbers only.",
+    "spot": 500.0,
+    "candidates_calls": [{"strike": 503, "delta": 0.31}, {"strike": 504, "delta": 0.26}, {"strike": 505, "delta": 0.21}],
+    "candidates_puts": [{"strike": 495, "delta": -0.29}, {"strike": 494, "delta": -0.24}, {"strike": 493, "delta": -0.20}],
+    "result": {
+      "call_25d_strike": 504,
+      "put_25d_strike": 494,
+      "range": [494, 504],
+      "skew_tilt": "((500-494) - (504-500)) / 500 = 0.004 -> put side wider by 0.40% of spot"
+    }
+  },
+  "caveats": [
+    "Educational only, not trading advice.",
+    "IV carries a variance risk premium, so realized moves often stay inside the 25Δ range on quiet days; breaches cluster in negative-gamma regimes.",
+    "Delta is model (Black-Scholes, q=0, calendar-time T) delta, not a broker-supplied delta; results can differ slightly from vendor greeks.",
+    "The 1-day T floor makes same-day (0DTE) deltas less extreme than a true intraday T would, so the 25Δ strikes sit wider than an intraday-time model would place them."
+  ],
+  "api": {
+    "single": "GET /api/range/{symbol}",
+    "all": "GET /api/range",
+    "fields": "call_25d_strike, put_25d_strike, call_25d_iv, put_25d_iv, skew_tilt (plus atm_iv, expected_move_1sd, regime, walls, read_headline, read_bullets)"
+  }
+}
